@@ -1,11 +1,20 @@
 # Dependencies
 node_modules/
 .pnpm-store/
+.venv/
 
 # Build outputs
 dist/
 build/
 out/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 
 # IDE
 .idea/

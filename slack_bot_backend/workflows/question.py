@@ -44,7 +44,7 @@ class QuestionWorkflow:
             answer = llm_result.content.strip() or "I couldn't produce a grounded answer for that question."
             await self.slack.post_message(
                 request.channel,
-                self._format_slack_response(answer, documents),
+                self._format_slack_response(answer, documents, provider=llm_result.provider),
                 thread_ts=request.thread_ts,
             )
             return QuestionRouteResult(
@@ -115,15 +115,19 @@ class QuestionWorkflow:
         )
 
     @staticmethod
-    def _format_slack_response(answer: str, documents: list[DocumentationMatch]) -> str:
+    def _format_slack_response(
+        answer: str, documents: list[DocumentationMatch], *, provider: str = "",
+    ) -> str:
+        model_footer = f"\n_Model: `{provider}`_" if provider else ""
         if not documents:
             return (
                 f"{answer}\n\n"
                 "_I couldn't find a close internal documentation match in Supabase pgvector, "
                 "so this answer is based only on the available Slack thread context._"
+                f"{model_footer}"
             )
         sources = "\n".join(
             f"• {(document.title or document.source_id)}{f' — {document.path}' if document.path else ''}"
             for document in documents
         )
-        return f"{answer}\n\n*Sources*\n{sources}"
+        return f"{answer}\n\n*Sources*\n{sources}{model_footer}"

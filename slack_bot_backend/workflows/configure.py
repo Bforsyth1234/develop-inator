@@ -63,7 +63,7 @@ class ConfigureWorkflow:
         self, *, channel: str, thread_ts: str, user_message: str, user_id: str | None = None,
     ) -> ConfigureResult:
         try:
-            extracted = await self._extract_config(user_message)
+            extracted, provider = await self._extract_config(user_message)
             new_repo_path = extracted.get("repo_path") or None
             new_github_repo = extracted.get("github_repository") or None
 
@@ -97,10 +97,12 @@ class ConfigureWorkflow:
             if new_github_repo:
                 changes.append(f"• github_repository → `{new_github_repo}`")
 
+            model_footer = f"\n_Model: `{provider}`_" if provider else ""
             message = (
                 ":white_check_mark: Repository configuration updated!\n"
                 + "\n".join(changes)
                 + "\n\nThese changes take effect immediately for new tasks."
+                + model_footer
             )
             await self._post(channel, message, thread_ts)
             return ConfigureResult(
@@ -118,14 +120,15 @@ class ConfigureWorkflow:
                 logger.exception("Failed to post CONFIGURE error to Slack")
             return ConfigureResult(status="error", message=error_msg)
 
-    async def _extract_config(self, user_message: str) -> dict[str, str | None]:
+    async def _extract_config(self, user_message: str) -> tuple[dict[str, str | None], str]:
+        """Return (extracted_config, provider) from the LLM."""
         prompt = _EXTRACTION_PROMPT.format(
             current_repo_path=self.repo_path or "(not set)",
             current_github_repository=self.github_repository or "(not set)",
             user_message=user_message,
         )
         result = await self.llm.generate(prompt)
-        return self._parse_extraction(result.content)
+        return self._parse_extraction(result.content), result.provider
 
     @staticmethod
     def _parse_extraction(raw: str) -> dict[str, str | None]:

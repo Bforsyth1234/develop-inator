@@ -8,6 +8,7 @@ from collections.abc import Sequence
 
 from slack_bot_backend.models.action import ProposedFileChange, RepositorySearchResult
 from slack_bot_backend.models.persistence import DocumentationMatch, JSONValue, SlackThreadMessageRecord
+from slack_bot_backend.services.supabase_persistence import RepositoryConfig
 
 from .interfaces import (
     EmbeddingResult,
@@ -63,6 +64,18 @@ class StubSupabaseRepository(SupabaseRepository):
         )
         return []
 
+    async def get_repository_config(self) -> RepositoryConfig | None:
+        logger.info("Stub Supabase get_repository_config invoked")
+        return None
+
+    async def save_repository_config(
+        self, *, repo_path: str, github_repository: str
+    ) -> None:
+        logger.info(
+            "Stub Supabase save_repository_config invoked",
+            extra={"repo_path": repo_path, "github_repository": github_repository},
+        )
+
 
 class StubLanguageModel(LanguageModel):
     async def generate(self, prompt: str) -> LLMResult:
@@ -104,6 +117,11 @@ class StubLanguageModel(LanguageModel):
                 content=json.dumps(
                     {"intent": "ACTION", "rationale": "Stub default: treating request as an action."}
                 ),
+                provider="stub",
+            )
+        if "configuration assistant" in prompt.lower():
+            return LLMResult(
+                content=json.dumps({"repo_path": None, "github_repository": None}),
                 provider="stub",
             )
         return LLMResult(content="stub-response", provider="stub")

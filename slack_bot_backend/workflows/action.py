@@ -18,7 +18,7 @@ from slack_bot_backend.models.action import (
     AiderResult,
     EvaluationResult,
 )
-from slack_bot_backend.services.interfaces import LanguageModel, PullRequestDraft, SlackGateway
+from slack_bot_backend.services.interfaces import LanguageModel, PullRequestDraft, SlackGateway, SupabaseRepository
 
 logger = logging.getLogger(__name__)
 
@@ -119,12 +119,16 @@ class ActionWorkflow:
         git: ActionGitOperations,
         llm: LanguageModel,
         repo_path: str,
+        github_repository: str = "",
+        supabase: SupabaseRepository | None = None,
         model_tier_map: dict[str, str] | None = None,
     ) -> None:
         self.slack = slack
         self.git = git
         self.llm = llm
         self.repo_path = repo_path
+        self.github_repository = github_repository
+        self.supabase = supabase
         self.model_tier_map: dict[str, str] = dict(model_tier_map or _MODEL_TIER_MAP)
 
     # ------------------------------------------------------------------
@@ -253,6 +257,10 @@ class ActionWorkflow:
     async def _run_aider(
         self, request: ActionRequest, *, optimized_prompt: str, model: str
     ) -> AiderResult:
+        if not self.repo_path:
+            raise RuntimeError(
+                "repo_path is empty. Set SLACK_BOT_REPO_PATH to an existing local clone."
+            )
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         branch_name = f"ai-update-{timestamp}"
         subprocess_env = self._build_subprocess_env()
@@ -389,6 +397,10 @@ class ActionWorkflow:
                 branch_name=branch_name,
             )
         )
+
+        # Persist the repo config so the bot remembers the last repo it worked with
+        await self._save_repository_config()
+
         message = (
             f":white_check_mark: Aider pushed `{branch_name}` and opened a PR.\n"
             f"PR: {pr_url}"
@@ -439,6 +451,21 @@ class ActionWorkflow:
             f"```\n{stdout_excerpt}\n```\n\n"
             "</details>"
         )
+
+    async def _save_repository_config(self) -> None:
+        """Persist the current repo_path and github_repository to Supabase."""
+        if self.supabase is None:
+            return
+        try:
+            await self.supabase.save_repository_config(
+                repo_path=self.repo_path,
+                github_repository=self.github_repository,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to persist repository config to Supabase; continuing",
+                exc_info=True,
+            )
 
     async def _post_message(self, request: ActionRequest, text: str) -> None:
         try:

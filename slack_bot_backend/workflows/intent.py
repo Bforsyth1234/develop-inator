@@ -12,6 +12,7 @@ from slack_bot_backend.models.persistence import SlackThreadMessageRecord
 from slack_bot_backend.models.question import QuestionRequest
 from slack_bot_backend.models.slack import SlackEvent, SlackEventEnvelope
 from slack_bot_backend.services.interfaces import LanguageModel, SlackGateway, SupabaseRepository
+from slack_bot_backend.workflows.configure import ConfigureWorkflow
 from slack_bot_backend.workflows.question import QuestionWorkflow
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,7 @@ class IntentWorkflow:
         *,
         question: QuestionWorkflow | None = None,
         action: ActionRunner | None = None,
+        configure: ConfigureWorkflow | None = None,
         thread_history_limit: int = 8,
     ) -> None:
         self.slack = slack
@@ -37,6 +39,7 @@ class IntentWorkflow:
         self.llm = llm
         self.question = question
         self.action = action
+        self.configure = configure
         self.thread_history_limit = thread_history_limit
 
     async def process_app_mention(self, envelope: SlackEventEnvelope) -> IntentClassification | None:
@@ -121,6 +124,15 @@ class IntentWorkflow:
             )
             return
 
+        if classification.intent is IntentType.CONFIGURE and self.configure is not None:
+            await self.configure.run(
+                channel=event.channel or "",
+                thread_ts=event.conversation_ts or "",
+                user_message=event.prompt_text,
+                user_id=event.user,
+            )
+            return
+
         await self.slack.post_message(
             event.channel or "",
             self._format_slack_response(event, classification),
@@ -131,9 +143,11 @@ class IntentWorkflow:
         return (
             "You classify Slack bot mentions into exactly one intent.\n"
             "Return JSON only with this exact schema: "
-            '{"intent":"QUESTION|ACTION","rationale":"brief explanation"}.\n'
+            '{"intent":"QUESTION|ACTION|CONFIGURE","rationale":"brief explanation"}.\n'
             "Use QUESTION when the user mainly wants an answer, explanation, summary, or clarification.\n"
-            "Use ACTION when the user wants code changes, file updates, a PR, or another task to be carried out.\n\n"
+            "Use ACTION when the user wants code changes, file updates, a PR, or another task to be carried out.\n"
+            "Use CONFIGURE when the user wants to change, update, or switch the repository the bot is working with, "
+            "including changing the repo path, GitHub repository, or asking about the current configuration.\n\n"
             f"Current message:\n{event.prompt_text}\n\n"
             f"Recent thread context:\n{self._format_thread_context(thread_messages)}"
         )
@@ -167,11 +181,12 @@ class IntentWorkflow:
     @staticmethod
     def _format_slack_response(event: SlackEvent, classification: IntentClassification) -> str:
         user_reference = f" for <@{event.user}>" if event.user else ""
-        follow_up = (
-            "ACTION routing is not configured, so no repository changes were started."
-            if classification.intent is IntentType.ACTION
-            else "QUESTION routing is not configured, so I could not answer directly."
-        )
+        if classification.intent is IntentType.ACTION:
+            follow_up = "ACTION routing is not configured, so no repository changes were started."
+        elif classification.intent is IntentType.CONFIGURE:
+            follow_up = "CONFIGURE routing is not configured, so the repository settings were not changed."
+        else:
+            follow_up = "QUESTION routing is not configured, so I could not answer directly."
         return (
             f"Intent classified as *{classification.intent}*{user_reference}.\n"
             f"Rationale: {classification.rationale}\n"

@@ -301,6 +301,65 @@ class DocumentationChunkRepository:
             ) from exc
         return [self._deserialize_match(row) for row in _expect_list(response.data, "documentation matches")]
 
+    async def get_indexed_files(self, source_type: str = "codebase") -> dict[str, str]:
+        """Return ``{source_id: file_checksum}`` for every ``chunk_index=0`` row.
+
+        The *file_checksum* is read from the ``metadata`` JSONB column.  If a
+        row has no ``file_checksum`` key the value falls back to ``""``.
+        """
+        try:
+            response = await self._transport.request(
+                "GET",
+                "rest/v1/documentation_chunks",
+                query={
+                    "select": "source_id,metadata",
+                    "source_type": f"eq.{source_type}",
+                    "chunk_index": "eq.0",
+                },
+            )
+        except SupabasePersistenceError as exc:
+            logger.exception("Failed to fetch indexed files", extra=exc.to_dict())
+            raise SupabasePersistenceError(
+                "get_indexed_files",
+                "documentation_chunks",
+                "Could not fetch indexed file checksums",
+                details=exc.to_dict(),
+                status_code=exc.status_code,
+            ) from exc
+
+        result: dict[str, str] = {}
+        for row in _expect_list(response.data, "indexed files"):
+            mapping = _expect_mapping(row, "indexed file row")
+            source_id = str(mapping["source_id"])
+            metadata = _mapping_or_empty(mapping.get("metadata"))
+            file_checksum = str(metadata.get("file_checksum", ""))
+            result[source_id] = file_checksum
+        return result
+
+    async def delete_file_chunks(self, source_type: str, source_id: str) -> None:
+        """Delete **all** chunks associated with *source_id*."""
+        try:
+            await self._transport.request(
+                "DELETE",
+                "rest/v1/documentation_chunks",
+                query={
+                    "source_type": f"eq.{source_type}",
+                    "source_id": f"eq.{source_id}",
+                },
+            )
+        except SupabasePersistenceError as exc:
+            logger.exception(
+                "Failed to delete file chunks",
+                extra={**exc.to_dict(), "source_id": source_id},
+            )
+            raise SupabasePersistenceError(
+                "delete_file_chunks",
+                "documentation_chunks",
+                f"Could not delete chunks for {source_id}",
+                details=exc.to_dict(),
+                status_code=exc.status_code,
+            ) from exc
+
     @staticmethod
     def _serialize_chunk(chunk: DocumentationChunkRecord) -> dict[str, JSONValue]:
         metadata = dict(chunk.metadata)
@@ -337,11 +396,89 @@ class DocumentationChunkRepository:
         )
 
 
+@dataclass(frozen=True)
+class RepositoryConfig:
+    """Persisted repository configuration values."""
+
+    repo_path: str
+    github_repository: str
+    updated_at: str | None = None
+
+
+class RepositoryConfigRepository:
+    """Read/write the ``repository_config`` singleton row in Supabase."""
+
+    _CONFIG_KEY = "default"
+
+    def __init__(self, transport: AsyncSupabaseTransport) -> None:
+        self._transport = transport
+
+    async def get_config(self) -> RepositoryConfig | None:
+        """Return the stored config, or *None* if no row exists yet."""
+        try:
+            response = await self._transport.request(
+                "GET",
+                "rest/v1/repository_config",
+                query={
+                    "select": "repo_path,github_repository,updated_at",
+                    "config_key": f"eq.{self._CONFIG_KEY}",
+                    "limit": "1",
+                },
+            )
+        except SupabasePersistenceError as exc:
+            logger.warning(
+                "Failed to load repository config from Supabase",
+                extra=exc.to_dict(),
+            )
+            return None
+
+        rows = response.data
+        if not isinstance(rows, list) or len(rows) == 0:
+            return None
+        row = _expect_mapping(rows[0], "repository_config row")
+        return RepositoryConfig(
+            repo_path=str(row.get("repo_path", "")),
+            github_repository=str(row.get("github_repository", "")),
+            updated_at=_string_or_none(row.get("updated_at")),
+        )
+
+    async def save_config(
+        self, *, repo_path: str, github_repository: str
+    ) -> None:
+        """Upsert the singleton repository config row."""
+        payload: dict[str, JSONValue] = {
+            "config_key": self._CONFIG_KEY,
+            "repo_path": repo_path,
+            "github_repository": github_repository,
+            "updated_at": datetime.now().isoformat(),
+        }
+        try:
+            await self._transport.request(
+                "POST",
+                "rest/v1/repository_config",
+                json_body=payload,
+                headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+            )
+        except SupabasePersistenceError as exc:
+            logger.exception(
+                "Failed to save repository config to Supabase",
+                extra=exc.to_dict(),
+            )
+            raise SupabasePersistenceError(
+                "save_repository_config",
+                "repository_config",
+                "Could not persist repository config",
+                details=exc.to_dict(),
+                status_code=exc.status_code,
+            ) from exc
+
+
 class SupabasePersistenceRepository:
     def __init__(self, transport: AsyncSupabaseTransport) -> None:
         self._transport = transport
         self._thread_history = SlackThreadHistoryRepository(transport)
         self._documentation = DocumentationChunkRepository(transport)
+        self._repo_config = RepositoryConfigRepository(transport)
 
     async def healthcheck(self) -> bool:
         try:
@@ -381,6 +518,16 @@ class SupabasePersistenceRepository:
             limit=limit,
             min_similarity=min_similarity,
             metadata_filter=metadata_filter,
+        )
+
+    async def get_repository_config(self) -> RepositoryConfig | None:
+        return await self._repo_config.get_config()
+
+    async def save_repository_config(
+        self, *, repo_path: str, github_repository: str
+    ) -> None:
+        await self._repo_config.save_config(
+            repo_path=repo_path, github_repository=github_repository,
         )
 
 

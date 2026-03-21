@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from slack_bot_backend.config import Settings
 from slack_bot_backend.dependencies import ServiceContainer, build_service_container, get_container
@@ -9,7 +10,7 @@ from slack_bot_backend.services.stubs import (
     StubSlackGateway,
     StubSupabaseRepository,
 )
-from slack_bot_backend.services.supabase_persistence import SupabasePersistenceRepository
+from slack_bot_backend.services.supabase_persistence import RepositoryConfig, SupabasePersistenceRepository
 from slack_bot_backend.workflows import ActionWorkflow, IntentWorkflow, QuestionWorkflow
 
 
@@ -39,6 +40,7 @@ class DependencyTests(unittest.TestCase):
                 slack=StubSlackGateway(),
                 llm=StubLanguageModel(),
                 git=StubGitService(),
+                repo_path="",
             ),
             intent=IntentWorkflow(
                 slack=StubSlackGateway(),
@@ -70,6 +72,95 @@ class DependencyTests(unittest.TestCase):
         self.assertIsInstance(container.action, ActionWorkflow)
         self.assertIs(container.intent.supabase, container.supabase)
         self.assertIs(container.question.supabase, container.supabase)
+
+    def test_build_service_container_overrides_repo_config_from_supabase(self) -> None:
+        settings = Settings(
+            environment="testing",
+            supabase_enabled=True,
+            supabase_url="https://example.supabase.co",
+            supabase_service_role_key="service-role-key",
+            repo_path="/env/default/path",
+            github_repository="env/default-repo",
+        )
+        stored_config = RepositoryConfig(
+            repo_path="/supabase/override/path",
+            github_repository="supabase/override-repo",
+        )
+
+        with mock.patch.object(
+            SupabasePersistenceRepository,
+            "get_repository_config",
+            return_value=stored_config,
+        ):
+            container = build_service_container(settings)
+
+        self.assertEqual(container.action.repo_path, "/supabase/override/path")
+        self.assertEqual(container.action.github_repository, "supabase/override-repo")
+
+    def test_build_service_container_uses_env_defaults_when_supabase_returns_none(self) -> None:
+        settings = Settings(
+            environment="testing",
+            supabase_enabled=True,
+            supabase_url="https://example.supabase.co",
+            supabase_service_role_key="service-role-key",
+            repo_path="/env/path",
+            github_repository="env/repo",
+        )
+
+        with mock.patch.object(
+            SupabasePersistenceRepository,
+            "get_repository_config",
+            return_value=None,
+        ):
+            container = build_service_container(settings)
+
+        self.assertEqual(container.action.repo_path, "/env/path")
+        self.assertEqual(container.action.github_repository, "env/repo")
+
+    def test_build_service_container_uses_env_defaults_when_supabase_fetch_fails(self) -> None:
+        settings = Settings(
+            environment="testing",
+            supabase_enabled=True,
+            supabase_url="https://example.supabase.co",
+            supabase_service_role_key="service-role-key",
+            repo_path="/env/fallback",
+            github_repository="env/fallback-repo",
+        )
+
+        with mock.patch.object(
+            SupabasePersistenceRepository,
+            "get_repository_config",
+            side_effect=RuntimeError("Supabase down"),
+        ):
+            container = build_service_container(settings)
+
+        self.assertEqual(container.action.repo_path, "/env/fallback")
+        self.assertEqual(container.action.github_repository, "env/fallback-repo")
+
+    def test_build_service_container_partial_override_from_supabase(self) -> None:
+        """Only repo_path is set in Supabase; github_repository falls back to env."""
+        settings = Settings(
+            environment="testing",
+            supabase_enabled=True,
+            supabase_url="https://example.supabase.co",
+            supabase_service_role_key="service-role-key",
+            repo_path="/env/path",
+            github_repository="env/repo",
+        )
+        stored_config = RepositoryConfig(
+            repo_path="/supabase/path",
+            github_repository="",  # empty → fall back to env
+        )
+
+        with mock.patch.object(
+            SupabasePersistenceRepository,
+            "get_repository_config",
+            return_value=stored_config,
+        ):
+            container = build_service_container(settings)
+
+        self.assertEqual(container.action.repo_path, "/supabase/path")
+        self.assertEqual(container.action.github_repository, "env/repo")
 
 
 if __name__ == "__main__":

@@ -120,3 +120,72 @@ async def handle_slack_events(
 
     background_tasks.add_task(container.intent.process_app_mention, envelope)
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# GitHub webhook — triggers re-indexing on pushes to the default branch
+# ---------------------------------------------------------------------------
+
+
+def _verify_github_signature(secret: str, body: bytes, signature_header: str | None) -> None:
+    """Verify the X-Hub-Signature-256 header from GitHub."""
+    if not signature_header:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing GitHub signature")
+    expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature_header):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid GitHub signature")
+
+
+@router.post("/github/webhook", tags=["github"])
+async def handle_github_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, object]:
+    body = await request.body()
+
+    # Verify signature if a webhook secret is configured
+    if container.settings.github_webhook_secret:
+        _verify_github_signature(
+            container.settings.github_webhook_secret,
+            body,
+            request.headers.get("x-hub-signature-256"),
+        )
+
+    event_type = request.headers.get("x-github-event")
+    if event_type == "ping":
+        return {"ok": True, "message": "pong"}
+
+    if event_type != "push":
+        return {"ok": True, "message": f"ignored event: {event_type}"}
+
+    import json as _json
+
+    try:
+        payload = _json.loads(body)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON payload"
+        ) from exc
+
+    ref: str = payload.get("ref", "")
+    default_branch = payload.get("repository", {}).get("default_branch", "main")
+
+    # Only re-index on pushes to the default branch (e.g. refs/heads/main)
+    if ref != f"refs/heads/{default_branch}":
+        logger.info(
+            "Ignoring push to non-default branch",
+            extra={"ref": ref, "default_branch": default_branch},
+        )
+        return {"ok": True, "message": f"ignored ref: {ref}"}
+
+    if container.indexer is None:
+        logger.warning("GitHub webhook received but indexer is not configured")
+        return {"ok": False, "message": "indexer not configured"}
+
+    logger.info(
+        "GitHub push to default branch detected — scheduling re-index",
+        extra={"ref": ref, "default_branch": default_branch},
+    )
+    background_tasks.add_task(container.indexer.reindex)
+    return {"ok": True, "message": "re-index scheduled"}

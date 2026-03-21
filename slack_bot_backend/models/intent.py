@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 class IntentType(StrEnum):
     QUESTION = "QUESTION"
     ACTION = "ACTION"
+    CONFIGURE = "CONFIGURE"
 
 
 class IntentClassification(BaseModel):

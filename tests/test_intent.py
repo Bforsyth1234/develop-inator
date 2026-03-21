@@ -14,7 +14,7 @@ from slack_bot_backend.models.persistence import DocumentationMatch, SlackThread
 from slack_bot_backend.models.slack import SlackEvent, SlackEventEnvelope
 from slack_bot_backend.services.interfaces import EmbeddingResult, LLMResult
 from slack_bot_backend.services.stubs import StubGitService
-from slack_bot_backend.workflows import IntentWorkflow, QuestionWorkflow
+from slack_bot_backend.workflows import ConfigureWorkflow, IntentWorkflow, QuestionWorkflow
 
 
 class FakeSlackGateway:
@@ -35,6 +35,7 @@ class FakeSupabaseRepository:
         self.thread_messages = thread_messages or []
         self.documents = documents or []
         self.thread_calls: list[dict[str, str | int]] = []
+        self.saved_configs: list[dict[str, str]] = []
 
     async def healthcheck(self) -> bool:
         return True
@@ -55,6 +56,12 @@ class FakeSupabaseRepository:
     ) -> list[DocumentationMatch]:
         return self.documents[:limit]
 
+    async def get_repository_config(self):
+        return None
+
+    async def save_repository_config(self, *, repo_path: str, github_repository: str) -> None:
+        self.saved_configs.append({"repo_path": repo_path, "github_repository": github_repository})
+
 
 class FakeLanguageModel:
     def __init__(
@@ -62,14 +69,21 @@ class FakeLanguageModel:
         *,
         classify_answer: str = '{"intent":"QUESTION","rationale":"The user is asking for guidance."}',
         question_answer: str = "Grounded answer.",
+        configure_answer: str = '{"repo_path": null, "github_repository": null}',
     ) -> None:
         self.classify_answer = classify_answer
         self.question_answer = question_answer
+        self.configure_answer = configure_answer
         self.prompts: list[str] = []
 
     async def generate(self, prompt: str) -> LLMResult:
         self.prompts.append(prompt)
-        content = self.classify_answer if prompt.startswith("You classify Slack bot mentions") else self.question_answer
+        if prompt.startswith("You classify Slack bot mentions"):
+            content = self.classify_answer
+        elif "configuration assistant" in prompt.lower():
+            content = self.configure_answer
+        else:
+            content = self.question_answer
         return LLMResult(content=content, provider="fake-llm")
 
     async def embed(self, text: str) -> EmbeddingResult:
@@ -214,6 +228,101 @@ class IntentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(action.requests), 1)
         self.assertEqual(action.requests[0]["thread_ts"], "1710.3")
         self.assertEqual(action.requests[0]["request"], "update the deploy docs")
+
+    async def test_process_app_mention_routes_configure_to_configure_workflow(self) -> None:
+        slack = FakeSlackGateway()
+        supabase = FakeSupabaseRepository()
+        llm = FakeLanguageModel(
+            classify_answer='{"intent":"CONFIGURE","rationale":"The user wants to change the repo."}',
+            configure_answer='{"repo_path": "/new/path", "github_repository": "org/new-repo"}',
+        )
+        configure = ConfigureWorkflow(
+            slack=slack, supabase=supabase, llm=llm,
+            repo_path="/old/path", github_repository="org/old-repo",
+        )
+        workflow = IntentWorkflow(
+            slack=slack, supabase=supabase, llm=llm, configure=configure,
+        )
+
+        classification = await workflow.process_app_mention(
+            SlackEventEnvelope(
+                type="event_callback",
+                event=SlackEvent(
+                    type="app_mention",
+                    channel="C123",
+                    user="U999",
+                    text="<@BOT> switch to org/new-repo at /new/path",
+                    ts="1710.3",
+                ),
+            )
+        )
+
+        self.assertIsNotNone(classification)
+        self.assertEqual(str(classification.intent), "CONFIGURE")
+        self.assertEqual(len(supabase.saved_configs), 1)
+        self.assertEqual(supabase.saved_configs[0]["repo_path"], "/new/path")
+        self.assertEqual(supabase.saved_configs[0]["github_repository"], "org/new-repo")
+        self.assertEqual(len(slack.messages), 1)
+        self.assertIn("updated", slack.messages[0]["text"])
+
+    async def test_configure_without_workflow_posts_fallback(self) -> None:
+        slack = FakeSlackGateway()
+        llm = FakeLanguageModel(
+            classify_answer='{"intent":"CONFIGURE","rationale":"User wants to change repo."}'
+        )
+        workflow = IntentWorkflow(
+            slack=slack, supabase=FakeSupabaseRepository(), llm=llm,
+        )
+
+        classification = await workflow.process_app_mention(
+            SlackEventEnvelope(
+                type="event_callback",
+                event=SlackEvent(
+                    type="app_mention",
+                    channel="C123",
+                    user="U999",
+                    text="<@BOT> change the repo",
+                    ts="1710.3",
+                ),
+            )
+        )
+
+        self.assertIsNotNone(classification)
+        self.assertEqual(str(classification.intent), "CONFIGURE")
+        self.assertEqual(len(slack.messages), 1)
+        self.assertIn("CONFIGURE", slack.messages[0]["text"])
+
+    async def test_configure_partial_update_keeps_existing_values(self) -> None:
+        slack = FakeSlackGateway()
+        supabase = FakeSupabaseRepository()
+        llm = FakeLanguageModel(
+            classify_answer='{"intent":"CONFIGURE","rationale":"User wants to change repo."}',
+            configure_answer='{"repo_path": null, "github_repository": "org/only-this"}',
+        )
+        configure = ConfigureWorkflow(
+            slack=slack, supabase=supabase, llm=llm,
+            repo_path="/existing/path", github_repository="org/old",
+        )
+        workflow = IntentWorkflow(
+            slack=slack, supabase=supabase, llm=llm, configure=configure,
+        )
+
+        await workflow.process_app_mention(
+            SlackEventEnvelope(
+                type="event_callback",
+                event=SlackEvent(
+                    type="app_mention",
+                    channel="C123",
+                    user="U999",
+                    text="<@BOT> switch to org/only-this",
+                    ts="1710.3",
+                ),
+            )
+        )
+
+        self.assertEqual(len(supabase.saved_configs), 1)
+        self.assertEqual(supabase.saved_configs[0]["repo_path"], "/existing/path")
+        self.assertEqual(supabase.saved_configs[0]["github_repository"], "org/only-this")
 
     async def test_classify_rejects_non_json_output(self) -> None:
         workflow = IntentWorkflow(

@@ -1,6 +1,6 @@
-"""Workflow orchestration boundary for future QUESTION/ACTION flows."""
+"""Workflow orchestration boundary for QUESTION/ACTION/CONFIGURE flows."""
 
-__all__ = ["ActionWorkflow", "IntentWorkflow", "QuestionWorkflow"]
+__all__ = ["ActionWorkflow", "ConfigureWorkflow", "IntentWorkflow", "QuestionWorkflow"]
 
 
 def __getattr__(name: str):
@@ -8,6 +8,10 @@ def __getattr__(name: str):
         from .action import ActionWorkflow
 
         return ActionWorkflow
+    if name == "ConfigureWorkflow":
+        from .configure import ConfigureWorkflow
+
+        return ConfigureWorkflow
     if name == "IntentWorkflow":
         from .intent import IntentWorkflow
 

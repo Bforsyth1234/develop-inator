@@ -6,7 +6,9 @@ import os
 from collections.abc import Mapping
 from enum import StrEnum
 from functools import lru_cache
+from pathlib import Path
 
+from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
@@ -20,6 +22,8 @@ class LLMProvider(StrEnum):
     STUB = "stub"
     OPENAI = "openai"
     ANTHROPIC = "anthropic"
+    GROQ = "groq"
+    ROUTER = "router"
 
 
 class GitProvider(StrEnum):
@@ -51,9 +55,16 @@ class Settings(BaseModel):
     llm_api_key: str | None = Field(default=None, repr=False)
     openai_api_key: str | None = Field(default=None, repr=False)
 
+    # Routing LLM configuration (used when llm_provider = "router")
+    groq_api_key: str | None = Field(default=None, repr=False)
+    router_light_model: str = "groq/qwen/qwen3-32b"
+    router_standard_model: str = "anthropic/claude-sonnet-4-20250514"
+    router_heavy_model: str = "anthropic/claude-opus-4-20250514"
+
     git_provider: GitProvider = GitProvider.STUB
     github_token: str | None = Field(default=None, repr=False)
     github_repository: str | None = None
+    github_webhook_secret: str | None = Field(default=None, repr=False)
 
     # Aider execution
     repo_path: str = ""
@@ -72,8 +83,12 @@ class Settings(BaseModel):
             raise ValueError(
                 "SUPABASE_SERVICE_ROLE_KEY is required when Supabase is enabled"
             )
-        if self.llm_provider is not LLMProvider.STUB and not self.llm_api_key:
+        if self.llm_provider in (LLMProvider.ANTHROPIC, LLMProvider.OPENAI) and not self.llm_api_key:
             raise ValueError("LLM_API_KEY is required for non-stub LLM providers")
+        if self.llm_provider is LLMProvider.GROQ and not self.groq_api_key:
+            raise ValueError("GROQ_API_KEY is required when using the Groq provider")
+        if self.llm_provider is LLMProvider.ROUTER and not self.llm_api_key:
+            raise ValueError("LLM_API_KEY is required for the router provider (used for standard/heavy tiers)")
         if self.git_provider is GitProvider.GITHUB and not self.github_token:
             raise ValueError("GITHUB_TOKEN is required when using the GitHub provider")
         return self
@@ -103,9 +118,14 @@ class Settings(BaseModel):
             "llm_provider": source.get("SLACK_BOT_LLM_PROVIDER"),
             "llm_api_key": source.get("SLACK_BOT_LLM_API_KEY"),
             "openai_api_key": source.get("SLACK_BOT_OPENAI_API_KEY"),
+            "groq_api_key": source.get("SLACK_BOT_GROQ_API_KEY"),
+            "router_light_model": source.get("SLACK_BOT_ROUTER_LIGHT_MODEL"),
+            "router_standard_model": source.get("SLACK_BOT_ROUTER_STANDARD_MODEL"),
+            "router_heavy_model": source.get("SLACK_BOT_ROUTER_HEAVY_MODEL"),
             "git_provider": source.get("SLACK_BOT_GIT_PROVIDER"),
             "github_token": source.get("SLACK_BOT_GITHUB_TOKEN"),
             "github_repository": source.get("SLACK_BOT_GITHUB_REPOSITORY"),
+            "github_webhook_secret": source.get("SLACK_BOT_GITHUB_WEBHOOK_SECRET"),
             "repo_path": source.get("SLACK_BOT_REPO_PATH"),
             "aider_model_simple": source.get("AIDER_MODEL_SIMPLE"),
             "aider_model_complex": source.get("AIDER_MODEL_COMPLEX"),
@@ -116,4 +136,8 @@ class Settings(BaseModel):
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
+    # Auto-load .env from the project root (if present) so callers don't need
+    # to manually ``source .env`` before starting the server.
+    _env_file = Path(__file__).resolve().parent.parent / ".env"
+    load_dotenv(_env_file)
     return Settings.from_env()

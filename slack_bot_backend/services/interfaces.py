@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from slack_bot_backend.models.action import ProposedFileChange, RepositorySearchResult
 from slack_bot_backend.models.persistence import DocumentationMatch, JSONValue, SlackThreadMessageRecord
+
+if TYPE_CHECKING:
+    from slack_bot_backend.services.supabase_persistence import RepositoryConfig
 
 
 @dataclass(frozen=True)
@@ -48,6 +51,12 @@ class SupabaseRepository(Protocol):
         min_similarity: float = 0.0,
         metadata_filter: dict[str, JSONValue] | None = None,
     ) -> list[DocumentationMatch]: ...
+
+    async def get_repository_config(self) -> RepositoryConfig | None: ...
+
+    async def save_repository_config(
+        self, *, repo_path: str, github_repository: str
+    ) -> None: ...
 
 
 class LanguageModel(Protocol):

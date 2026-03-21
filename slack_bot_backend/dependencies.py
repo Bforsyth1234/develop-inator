@@ -2,20 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from fastapi import Request
 
 from .config import GitProvider, LLMProvider, Settings
+from .services.indexer import CodebaseIndexer
 from .services.interfaces import GitService, LanguageModel, SlackGateway, SupabaseRepository  # noqa: F401 – LanguageModel kept for external callers
 from .services.supabase_persistence import SupabasePersistenceRepository, UrllibSupabaseTransport
 from .services.stubs import StubGitService, StubLanguageModel, StubSlackGateway, StubSupabaseRepository
+from .workflows.configure import ConfigureWorkflow
 from .workflows.intent import IntentWorkflow
 from .workflows.question import QuestionWorkflow
 
 if TYPE_CHECKING:
     from .workflows.action import ActionWorkflow
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -28,20 +34,74 @@ class ServiceContainer:
     intent: IntentWorkflow
     question: QuestionWorkflow
     action: ActionWorkflow
+    configure: ConfigureWorkflow | None = None
+    indexer: CodebaseIndexer | None = None
 
 
 def build_service_container(settings: Settings) -> ServiceContainer:
     slack = _build_slack_gateway(settings)
     supabase = _build_supabase_repository(settings)
     llm = _build_language_model(settings)
-    git = _build_git_service(settings)
-    action = _build_action_workflow(slack=slack, git=git, llm=llm, settings=settings)
+
+    # Load dynamic repo config from Supabase, falling back to env values
+    repo_path = settings.repo_path
+    github_repository = settings.github_repository or ""
+    if isinstance(supabase, SupabasePersistenceRepository):
+        try:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop and loop.is_running():
+                # We're inside an async context already; create a new loop in a thread
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    config = pool.submit(
+                        asyncio.run, supabase.get_repository_config()
+                    ).result()
+            else:
+                config = asyncio.run(supabase.get_repository_config())
+            if config is not None:
+                if config.repo_path:
+                    repo_path = config.repo_path
+                    logger.info("Loaded repo_path from Supabase: %s", repo_path)
+                if config.github_repository:
+                    github_repository = config.github_repository
+                    logger.info(
+                        "Loaded github_repository from Supabase: %s",
+                        github_repository,
+                    )
+        except Exception:
+            logger.warning(
+                "Could not load repository config from Supabase; using env defaults",
+                exc_info=True,
+            )
+
+    git = _build_git_service(settings, github_repository=github_repository)
+    action = _build_action_workflow(
+        slack=slack,
+        git=git,
+        llm=llm,
+        supabase=supabase,
+        repo_path=repo_path,
+        github_repository=github_repository,
+        settings=settings,
+    )
     question = QuestionWorkflow(
         slack=slack,
         supabase=supabase,
         llm=llm,
         thread_history_limit=settings.slack_thread_context_limit,
     )
+    configure = ConfigureWorkflow(
+        slack=slack,
+        supabase=supabase,
+        llm=llm,
+        repo_path=repo_path,
+        github_repository=github_repository,
+    )
+    indexer = _build_indexer(settings, repo_path=repo_path)
     return ServiceContainer(
         settings=settings,
         slack=slack,
@@ -54,10 +114,13 @@ def build_service_container(settings: Settings) -> ServiceContainer:
             llm=llm,
             question=question,
             action=action,
+            configure=configure,
             thread_history_limit=settings.slack_thread_context_limit,
         ),
         question=question,
         action=action,
+        configure=configure,
+        indexer=indexer,
     )
 
 
@@ -89,16 +152,110 @@ def _build_language_model(settings: Settings) -> LanguageModel:
             api_key=settings.llm_api_key or "",
             openai_api_key=settings.openai_api_key,
         )
+
+    if settings.llm_provider is LLMProvider.OPENAI:
+        from .services.openai_llm import OpenAILanguageModel
+
+        return OpenAILanguageModel(
+            api_key=settings.llm_api_key or "",
+            provider_name="openai",
+        )
+
+    if settings.llm_provider is LLMProvider.GROQ:
+        from .services.openai_llm import OpenAILanguageModel
+
+        return OpenAILanguageModel(
+            api_key=settings.groq_api_key or "",
+            model="llama-3.3-70b-versatile",
+            base_url="https://api.groq.com/openai/v1",
+            provider_name="groq",
+        )
+
+    if settings.llm_provider is LLMProvider.ROUTER:
+        return _build_routing_language_model(settings)
+
     return StubLanguageModel()
 
 
-def _build_git_service(settings: Settings) -> GitService:
+def _build_routing_language_model(settings: Settings) -> LanguageModel:
+    """Assemble a RoutingLanguageModel from per-tier model specifications."""
+    from .services.routing_llm import RoutingLanguageModel
+
+    tier_models: dict[str, object] = {}
+
+    for tier, spec in [
+        ("light", settings.router_light_model),
+        ("standard", settings.router_standard_model),
+        ("heavy", settings.router_heavy_model),
+    ]:
+        tier_models[tier] = _build_model_from_spec(settings, spec)
+
+    # The router itself uses the light-tier model (fast/cheap)
+    router_model = tier_models["light"]
+
+    # Embeddings use the standard model (which likely has OpenAI access)
+    embed_model = tier_models.get("standard")
+
+    return RoutingLanguageModel(
+        router_model=router_model,
+        model_registry=tier_models,
+        default_tier="standard",
+        embed_model=embed_model,
+    )
+
+
+def _build_model_from_spec(settings: Settings, spec: str) -> LanguageModel:
+    """Build a LanguageModel from a 'provider/model' spec string like 'anthropic/claude-sonnet-4-20250514'."""
+    if "/" in spec:
+        provider, model = spec.split("/", 1)
+    else:
+        provider, model = spec, spec
+
+    if provider == "anthropic":
+        from .services.anthropic_llm import AnthropicLanguageModel
+
+        return AnthropicLanguageModel(
+            api_key=settings.llm_api_key or "",
+            model=model,
+            openai_api_key=settings.openai_api_key,
+        )
+    if provider == "groq":
+        from .services.openai_llm import OpenAILanguageModel
+
+        return OpenAILanguageModel(
+            api_key=settings.groq_api_key or settings.llm_api_key or "",
+            model=model,
+            base_url="https://api.groq.com/openai/v1",
+            provider_name="groq",
+        )
+    if provider == "openai":
+        from .services.openai_llm import OpenAILanguageModel
+
+        return OpenAILanguageModel(
+            api_key=settings.openai_api_key or settings.llm_api_key or "",
+            model=model,
+            provider_name="openai",
+        )
+
+    # Fallback: treat as OpenAI-compatible
+    from .services.openai_llm import OpenAILanguageModel
+
+    return OpenAILanguageModel(
+        api_key=settings.llm_api_key or "",
+        model=model,
+        provider_name=provider,
+    )
+
+
+def _build_git_service(
+    settings: Settings, *, github_repository: str = ""
+) -> GitService:
     if settings.git_provider is GitProvider.GITHUB:
         from .services.github import GitHubGitService
 
         return GitHubGitService(
             token=settings.github_token or "",
-            repository=settings.github_repository,
+            repository=github_repository or settings.github_repository,
         )
     return StubGitService()
 
@@ -108,6 +265,9 @@ def _build_action_workflow(
     slack: SlackGateway,
     git: GitService,
     llm: LanguageModel,
+    supabase: SupabaseRepository,
+    repo_path: str,
+    github_repository: str,
     settings: Settings,
 ) -> ActionWorkflow:
     from .workflows.action import ActionWorkflow
@@ -116,11 +276,36 @@ def _build_action_workflow(
         slack=slack,
         git=git,
         llm=llm,
-        repo_path=settings.repo_path,
+        repo_path=repo_path,
+        github_repository=github_repository,
+        supabase=supabase,
         model_tier_map={
             "simple": settings.aider_model_simple,
             "complex": settings.aider_model_complex,
         },
+    )
+
+
+def _build_indexer(
+    settings: Settings, *, repo_path: str = ""
+) -> CodebaseIndexer | None:
+    resolved_repo_path = repo_path or settings.repo_path
+    if (
+        not settings.supabase_enabled
+        or not settings.supabase_url
+        or not settings.supabase_service_role_key
+        or not settings.openai_api_key
+        or not resolved_repo_path
+    ):
+        return None
+    transport = UrllibSupabaseTransport(
+        base_url=settings.supabase_url,
+        service_role_key=settings.supabase_service_role_key,
+    )
+    return CodebaseIndexer(
+        openai_api_key=settings.openai_api_key,
+        transport=transport,
+        repo_path=resolved_repo_path,
     )
 
 

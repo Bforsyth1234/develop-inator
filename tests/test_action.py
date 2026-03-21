@@ -14,6 +14,7 @@ from slack_bot_backend.models.action import ActionRequest, ActionRouteResult, Pr
 from slack_bot_backend.services.github import GitHubGitService
 from slack_bot_backend.services.interfaces import LLMResult, PullRequestDraft
 from slack_bot_backend.services.stubs import StubGitService, StubLanguageModel, StubSlackGateway, StubSupabaseRepository
+from slack_bot_backend.services.supabase_persistence import RepositoryConfig
 from slack_bot_backend.workflows import ActionWorkflow, IntentWorkflow, QuestionWorkflow
 
 
@@ -61,6 +62,32 @@ class FakeLanguageModel:
 
     async def embed(self, text: str) -> object:
         return object()
+
+
+class FakeSupabaseRepository:
+    """Records save_repository_config calls and returns canned get results."""
+
+    def __init__(self, *, stored_config: RepositoryConfig | None = None, fail_save: bool = False) -> None:
+        self._stored_config = stored_config
+        self._fail_save = fail_save
+        self.save_calls: list[dict[str, str]] = []
+
+    async def healthcheck(self) -> bool:
+        return True
+
+    async def get_thread_messages(self, *, channel_id, thread_ts, limit=50):
+        return []
+
+    async def match_chunks(self, query_embedding, *, limit=5, min_similarity=0.0, metadata_filter=None):
+        return []
+
+    async def get_repository_config(self) -> RepositoryConfig | None:
+        return self._stored_config
+
+    async def save_repository_config(self, *, repo_path: str, github_repository: str) -> None:
+        if self._fail_save:
+            raise RuntimeError("Supabase unavailable")
+        self.save_calls.append({"repo_path": repo_path, "github_repository": github_repository})
 
 
 class FakeActionWorkflow:
@@ -467,6 +494,116 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("env", aider_kwargs)
         self.assertEqual(aider_kwargs["env"]["GROQ_API_KEY"], "gsk_test123")
         self.assertEqual(aider_kwargs["env"]["ANTHROPIC_API_KEY"], "sk-ant-test456")
+
+
+class ActionWorkflowRepoConfigTests(unittest.IsolatedAsyncioTestCase):
+    """Tests for saving repository config to Supabase after successful ACTION runs."""
+
+    async def test_success_saves_repo_config_to_supabase(self) -> None:
+        slack = FakeSlackGateway()
+        git = FakeGitService()
+        supabase = FakeSupabaseRepository()
+
+        workflow = ActionWorkflow(
+            slack=slack,
+            git=git,
+            llm=FakeLanguageModel(),
+            repo_path="/home/user/my-repo",
+            github_repository="owner/my-repo",
+            supabase=supabase,
+            model_tier_map=_DEFAULT_TIER_MAP,
+        )
+
+        with mock.patch(
+            "slack_bot_backend.workflows.action.asyncio.to_thread",
+            side_effect=_make_successful_side_effect(),
+        ):
+            result = await workflow.run(
+                ActionRequest(channel="C123", thread_ts="1710.2", request="Fix the bug")
+            )
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(len(supabase.save_calls), 1)
+        self.assertEqual(supabase.save_calls[0]["repo_path"], "/home/user/my-repo")
+        self.assertEqual(supabase.save_calls[0]["github_repository"], "owner/my-repo")
+
+    async def test_success_without_supabase_skips_config_save(self) -> None:
+        slack = FakeSlackGateway()
+        git = FakeGitService()
+
+        workflow = ActionWorkflow(
+            slack=slack,
+            git=git,
+            llm=FakeLanguageModel(),
+            repo_path="/tmp/repo",
+            model_tier_map=_DEFAULT_TIER_MAP,
+        )
+
+        with mock.patch(
+            "slack_bot_backend.workflows.action.asyncio.to_thread",
+            side_effect=_make_successful_side_effect(),
+        ):
+            result = await workflow.run(
+                ActionRequest(channel="C123", thread_ts="1710.2", request="Fix the bug")
+            )
+
+        self.assertEqual(result.status, "completed")
+        # No supabase → no crash, no save
+
+    async def test_config_save_failure_does_not_break_workflow(self) -> None:
+        slack = FakeSlackGateway()
+        git = FakeGitService()
+        supabase = FakeSupabaseRepository(fail_save=True)
+
+        workflow = ActionWorkflow(
+            slack=slack,
+            git=git,
+            llm=FakeLanguageModel(),
+            repo_path="/tmp/repo",
+            github_repository="owner/repo",
+            supabase=supabase,
+            model_tier_map=_DEFAULT_TIER_MAP,
+        )
+
+        with mock.patch(
+            "slack_bot_backend.workflows.action.asyncio.to_thread",
+            side_effect=_make_successful_side_effect(),
+        ):
+            result = await workflow.run(
+                ActionRequest(channel="C123", thread_ts="1710.2", request="Fix the bug")
+            )
+
+        # Workflow still completes even though save failed
+        self.assertEqual(result.status, "completed")
+        self.assertIn("https://example.invalid/pr/42", result.pr_url)
+
+    async def test_failure_does_not_save_repo_config(self) -> None:
+        slack = FakeSlackGateway()
+        git = FakeGitService()
+        supabase = FakeSupabaseRepository()
+
+        workflow = ActionWorkflow(
+            slack=slack,
+            git=git,
+            llm=FakeLanguageModel(),
+            repo_path="/tmp/repo",
+            github_repository="owner/repo",
+            supabase=supabase,
+            model_tier_map=_DEFAULT_TIER_MAP,
+        )
+
+        with mock.patch(
+            "slack_bot_backend.workflows.action.asyncio.to_thread",
+            side_effect=_make_git_aware_side_effect(
+                aider_returncode=1, aider_stderr="error", aider_stdout="",
+            ),
+        ):
+            result = await workflow.run(
+                ActionRequest(channel="C123", thread_ts="1710.2", request="Fix the bug")
+            )
+
+        self.assertEqual(result.status, "error")
+        self.assertEqual(len(supabase.save_calls), 0)
 
 
 class ActionEndpointTests(unittest.TestCase):

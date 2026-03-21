@@ -127,7 +127,8 @@ async def main() -> None:
     all_chunks: list[tuple[str, str, int, str, str]] = []
     for rel_path in files_to_index:
         file_hash, content = local_hashes[rel_path]
-        parts = _chunk_text(content)
+        ext = Path(rel_path).suffix
+        parts = _chunk_text(content, ext=ext)
         for idx, part in enumerate(parts):
             all_chunks.append((rel_path, rel_path, idx, part, file_hash))
 

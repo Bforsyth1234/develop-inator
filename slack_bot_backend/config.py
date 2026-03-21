@@ -66,6 +66,11 @@ class Settings(BaseModel):
     github_repository: str | None = None
     github_webhook_secret: str | None = Field(default=None, repr=False)
 
+    # Cohere reranking (optional – when set, hybrid search results are
+    # reranked with the Cohere Rerank API before being returned).
+    cohere_api_key: str | None = Field(default=None, repr=False)
+    cohere_rerank_model: str = "rerank-english-v3.0"
+
     # Aider execution
     repo_path: str = ""
     aider_model_simple: str = "groq/qwen/qwen3-32b"
@@ -119,6 +124,8 @@ class Settings(BaseModel):
             "llm_api_key": source.get("SLACK_BOT_LLM_API_KEY"),
             "openai_api_key": source.get("SLACK_BOT_OPENAI_API_KEY"),
             "groq_api_key": source.get("SLACK_BOT_GROQ_API_KEY"),
+            "cohere_api_key": source.get("SLACK_BOT_COHERE_API_KEY"),
+            "cohere_rerank_model": source.get("SLACK_BOT_COHERE_RERANK_MODEL"),
             "router_light_model": source.get("SLACK_BOT_ROUTER_LIGHT_MODEL"),
             "router_standard_model": source.get("SLACK_BOT_ROUTER_STANDARD_MODEL"),
             "router_heavy_model": source.get("SLACK_BOT_ROUTER_HEAVY_MODEL"),

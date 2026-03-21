@@ -37,6 +37,7 @@ class QuestionWorkflow:
             embedding = await self.llm.embed(request.question)
             documents = await self.supabase.match_chunks(
                 embedding.vector,
+                query_text=request.question,
                 limit=self.retrieval_limit,
             )
             prompt = self._build_prompt(request, thread_messages, documents)

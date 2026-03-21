@@ -49,6 +49,7 @@ class StubSupabaseRepository(SupabaseRepository):
         self,
         query_embedding: tuple[float, ...],
         *,
+        query_text: str = "",
         limit: int = 5,
         min_similarity: float = 0.0,
         metadata_filter: dict[str, JSONValue] | None = None,

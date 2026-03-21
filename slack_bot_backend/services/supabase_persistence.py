@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Protocol
 from urllib import error, parse, request
 
+from slack_bot_backend.config import get_settings
 from slack_bot_backend.models.persistence import (
     DocumentationChunkRecord,
     DocumentationMatch,
@@ -275,19 +276,23 @@ class DocumentationChunkRepository:
         self,
         query_embedding: Sequence[float],
         *,
+        query_text: str = "",
         limit: int = 5,
         min_similarity: float = 0.0,
         metadata_filter: Mapping[str, JSONValue] | None = None,
     ) -> list[DocumentationMatch]:
+        # Fetch a wider candidate set (20) from the hybrid RPC for reranking.
+        candidate_count = 20
         try:
             response = await self._transport.request(
                 "POST",
                 "rest/v1/rpc/match_documentation_chunks",
                 json_body={
                     "query_embedding": _vector_literal(query_embedding),
-                    "match_count": limit,
+                    "match_count": candidate_count,
                     "min_similarity": min_similarity,
                     "filter": dict(metadata_filter or {}),
+                    "query_text": query_text,
                 },
             )
         except SupabasePersistenceError as exc:
@@ -299,7 +304,11 @@ class DocumentationChunkRepository:
                 details=exc.to_dict(),
                 status_code=exc.status_code,
             ) from exc
-        return [self._deserialize_match(row) for row in _expect_list(response.data, "documentation matches")]
+        candidates = [self._deserialize_match(row) for row in _expect_list(response.data, "documentation matches")]
+
+        # Rerank with Cohere if configured; otherwise fall back to hybrid order.
+        reranked = await _cohere_rerank(query_text, candidates, top_n=limit)
+        return reranked
 
     async def get_indexed_files(self, source_type: str = "codebase") -> dict[str, str]:
         """Return ``{source_id: file_checksum}`` for every ``chunk_index=0`` row.
@@ -509,12 +518,14 @@ class SupabasePersistenceRepository:
         self,
         query_embedding: Sequence[float],
         *,
+        query_text: str = "",
         limit: int = 5,
         min_similarity: float = 0.0,
         metadata_filter: Mapping[str, JSONValue] | None = None,
     ) -> list[DocumentationMatch]:
         return await self._documentation.match_chunks(
             query_embedding,
+            query_text=query_text,
             limit=limit,
             min_similarity=min_similarity,
             metadata_filter=metadata_filter,
@@ -529,6 +540,58 @@ class SupabasePersistenceRepository:
         await self._repo_config.save_config(
             repo_path=repo_path, github_repository=github_repository,
         )
+
+
+async def _cohere_rerank(
+    query: str,
+    candidates: list[DocumentationMatch],
+    *,
+    top_n: int = 5,
+) -> list[DocumentationMatch]:
+    """Rerank *candidates* using the Cohere Rerank API.
+
+    If the Cohere API key is not configured or the query is empty the function
+    gracefully degrades by returning the first *top_n* candidates in their
+    original (hybrid RRF) order.
+    """
+    settings = get_settings()
+    if not settings.cohere_api_key or not query or not candidates:
+        return candidates[:top_n]
+
+    documents = [c.content for c in candidates]
+    payload = json.dumps({
+        "model": settings.cohere_rerank_model,
+        "query": query,
+        "documents": documents,
+        "top_n": top_n,
+        "return_documents": False,
+    }).encode("utf-8")
+
+    headers = {
+        "Authorization": f"Bearer {settings.cohere_api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    def _call_cohere() -> list[int]:
+        req = request.Request(
+            "https://api.cohere.com/v1/rerank",
+            data=payload,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=10) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+                return [r["index"] for r in body.get("results", [])]
+        except Exception:
+            logger.warning("Cohere rerank request failed; falling back to hybrid order", exc_info=True)
+            return []
+
+    reranked_indices = await asyncio.to_thread(_call_cohere)
+    if not reranked_indices:
+        return candidates[:top_n]
+    return [candidates[i] for i in reranked_indices if i < len(candidates)]
 
 
 def _decode_json_body(raw_body: str) -> JSONValue | None:

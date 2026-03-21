@@ -8,6 +8,10 @@ import logging
 from pathlib import Path
 
 import openai
+import tree_sitter_javascript as tsjavascript
+import tree_sitter_python as tspython
+import tree_sitter_typescript as tstypescript
+from tree_sitter import Language, Parser
 
 from slack_bot_backend.models.persistence import DocumentationChunkRecord, EmbeddingMetadata
 from slack_bot_backend.services.supabase_persistence import (
@@ -20,6 +24,7 @@ logger = logging.getLogger(__name__)
 EMBEDDING_MODEL = "text-embedding-3-small"
 CHUNK_MAX_CHARS = 2000
 CHUNK_OVERLAP_CHARS = 200
+AST_NODE_MAX_CHARS = 4000
 BATCH_SIZE = 20
 
 INDEXABLE_EXTENSIONS = {
@@ -30,6 +35,59 @@ INDEXABLE_EXTENSIONS = {
 SKIP_DIRS = {
     "node_modules", ".git", ".next", "__pycache__", ".venv", "venv",
     "dist", "build", ".turbo", ".cache", "coverage",
+}
+
+# ---------------------------------------------------------------------------
+# Tree-sitter language registry
+# ---------------------------------------------------------------------------
+
+_LANGUAGES: dict[str, Language] = {
+    ".py": Language(tspython.language()),
+    ".js": Language(tsjavascript.language()),
+    ".jsx": Language(tsjavascript.language()),
+    ".ts": Language(tstypescript.language_typescript()),
+    ".tsx": Language(tstypescript.language_tsx()),
+}
+
+# AST node types that represent complete semantic units per language.
+_TOPLEVEL_NODE_TYPES: dict[str, set[str]] = {
+    ".py": {
+        "function_definition",
+        "class_definition",
+        "decorated_definition",
+    },
+    ".js": {
+        "function_declaration",
+        "class_declaration",
+        "export_statement",
+        "lexical_declaration",
+        "expression_statement",
+    },
+    ".jsx": {
+        "function_declaration",
+        "class_declaration",
+        "export_statement",
+        "lexical_declaration",
+        "expression_statement",
+    },
+    ".ts": {
+        "function_declaration",
+        "class_declaration",
+        "export_statement",
+        "lexical_declaration",
+        "interface_declaration",
+        "type_alias_declaration",
+        "expression_statement",
+    },
+    ".tsx": {
+        "function_declaration",
+        "class_declaration",
+        "export_statement",
+        "lexical_declaration",
+        "interface_declaration",
+        "type_alias_declaration",
+        "expression_statement",
+    },
 }
 
 
@@ -52,11 +110,12 @@ def _collect_files(repo_root: Path) -> list[Path]:
     return files
 
 
-def _chunk_text(
+def _chunk_text_fallback(
     text: str,
     max_chars: int = CHUNK_MAX_CHARS,
     overlap: int = CHUNK_OVERLAP_CHARS,
 ) -> list[str]:
+    """Character-based chunking with overlap (used for non-code files)."""
     if len(text) <= max_chars:
         return [text]
     chunks: list[str] = []
@@ -66,6 +125,88 @@ def _chunk_text(
         chunks.append(text[start:end])
         start = end - overlap
     return chunks
+
+
+def _ast_chunk(text: str, ext: str) -> list[str] | None:
+    """Parse *text* with tree-sitter and return one chunk per semantic unit.
+
+    Returns ``None`` when the extension has no grammar or parsing fails so the
+    caller can fall back to character-based chunking.
+    """
+    language = _LANGUAGES.get(ext)
+    if language is None:
+        return None
+
+    try:
+        parser = Parser(language)
+        tree = parser.parse(text.encode("utf-8"))
+    except Exception:
+        logger.debug("tree-sitter parse failed for ext=%s, falling back", ext)
+        return None
+
+    if tree.root_node.has_error:
+        logger.debug("tree-sitter reported errors for ext=%s, falling back", ext)
+        return None
+
+    toplevel_types = _TOPLEVEL_NODE_TYPES.get(ext, set())
+    chunks: list[str] = []
+    preamble_parts: list[str] = []
+
+    for child in tree.root_node.children:
+        node_text = child.text.decode("utf-8") if child.text else ""
+        if not node_text.strip():
+            continue
+
+        if child.type in toplevel_types:
+            # Flush any accumulated preamble (imports, comments, etc.)
+            if preamble_parts:
+                chunks.append("\n".join(preamble_parts))
+                preamble_parts = []
+
+            # If the node is too large, sub-chunk it with character-based fallback
+            if len(node_text) > AST_NODE_MAX_CHARS:
+                chunks.extend(
+                    _chunk_text_fallback(node_text, CHUNK_MAX_CHARS, CHUNK_OVERLAP_CHARS)
+                )
+            else:
+                chunks.append(node_text)
+        else:
+            # Non-semantic nodes (imports, comments, module-level expressions)
+            preamble_parts.append(node_text)
+
+    # Flush remaining preamble
+    if preamble_parts:
+        preamble = "\n".join(preamble_parts)
+        if len(preamble) > CHUNK_MAX_CHARS:
+            chunks.extend(
+                _chunk_text_fallback(preamble, CHUNK_MAX_CHARS, CHUNK_OVERLAP_CHARS)
+            )
+        else:
+            chunks.append(preamble)
+
+    return chunks if chunks else None
+
+
+def _chunk_text(
+    text: str,
+    max_chars: int = CHUNK_MAX_CHARS,
+    overlap: int = CHUNK_OVERLAP_CHARS,
+    *,
+    ext: str = "",
+) -> list[str]:
+    """Split *text* into chunks for embedding.
+
+    When *ext* identifies a supported language (``.py``, ``.ts``, ``.js``, etc.)
+    the function parses the source into an AST and extracts complete semantic
+    units (functions, classes, etc.).  For non-code files or when parsing fails
+    it falls back to character-based chunking with overlap.
+    """
+    if ext:
+        ast_chunks = _ast_chunk(text, ext)
+        if ast_chunks is not None:
+            return ast_chunks
+
+    return _chunk_text_fallback(text, max_chars, overlap)
 
 
 async def _embed_batch(
@@ -150,7 +291,8 @@ class CodebaseIndexer:
         all_chunks: list[tuple[str, str, int, str, str]] = []
         for rel_path in files_to_index:
             file_hash, content = local_hashes[rel_path]
-            parts = _chunk_text(content)
+            ext = Path(rel_path).suffix
+            parts = _chunk_text(content, ext=ext)
             for idx, part in enumerate(parts):
                 all_chunks.append((rel_path, rel_path, idx, part, file_hash))
 

@@ -195,7 +195,7 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result.status, "completed")
-        self.assertEqual(result.provider, "aider")
+        self.assertEqual(result.provider, "groq/llama-3.3-70b-versatile")
         self.assertTrue(result.branch_name.startswith("ai-update-"))
         self.assertEqual(result.pr_url, "https://example.invalid/pr/42")
         self.assertEqual(len(git.pr_calls), 1)

@@ -150,7 +150,7 @@ class ActionWorkflow:
             )
             if aider_result.returncode != 0:
                 return await self._handle_failure(request, aider_result)
-            return await self._handle_success(request, aider_result)
+            return await self._handle_success(request, aider_result, model=selected_model)
         except Exception:
             logger.exception(
                 "ACTION workflow encountered an unexpected error",
@@ -387,7 +387,7 @@ class ActionWorkflow:
     # ------------------------------------------------------------------
 
     async def _handle_success(
-        self, request: ActionRequest, aider_result: AiderResult
+        self, request: ActionRequest, aider_result: AiderResult, *, model: str = "",
     ) -> ActionRouteResult:
         branch_name = aider_result.branch_name
         pr_url = await self.git.create_pull_request(
@@ -401,14 +401,16 @@ class ActionWorkflow:
         # Persist the repo config so the bot remembers the last repo it worked with
         await self._save_repository_config()
 
+        model_info = f"\n_Model: `{model}`_" if model else ""
         message = (
             f":white_check_mark: Aider pushed `{branch_name}` and opened a PR.\n"
             f"PR: {pr_url}"
+            f"{model_info}"
         )
         await self._post_message(request, message)
         return ActionRouteResult(
             status="completed",
-            provider="aider",
+            provider=model or "aider",
             message=message,
             pr_url=pr_url,
             branch_name=branch_name,

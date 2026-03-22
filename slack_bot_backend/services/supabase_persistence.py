@@ -12,6 +12,7 @@ from typing import Protocol
 from urllib import error, parse, request
 
 from slack_bot_backend.config import get_settings
+from slack_bot_backend.models.action import ActionExecution, ActionExecutionStatus
 from slack_bot_backend.models.persistence import (
     DocumentationChunkRecord,
     DocumentationMatch,
@@ -482,12 +483,100 @@ class RepositoryConfigRepository:
             ) from exc
 
 
+class ActionExecutionRepository:
+    """CRUD for the ``action_executions`` table (planner / approval flow)."""
+
+    _TABLE = "rest/v1/action_executions"
+
+    def __init__(self, transport: AsyncSupabaseTransport) -> None:
+        self._transport = transport
+
+    async def save(self, execution: ActionExecution) -> None:
+        payload: dict[str, JSONValue] = {
+            "id": execution.id,
+            "channel": execution.channel,
+            "thread_ts": execution.thread_ts,
+            "user_id": execution.user_id,
+            "original_request": execution.original_request,
+            "generated_spec": execution.generated_spec,
+            "status": execution.status,
+            "model": execution.model,
+        }
+        await self._transport.request(
+            "POST",
+            self._TABLE,
+            json_body=payload,
+            headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+        )
+
+    async def get(self, execution_id: str) -> ActionExecution | None:
+        response = await self._transport.request(
+            "GET",
+            self._TABLE,
+            query={
+                "select": "id,channel,thread_ts,user_id,original_request,generated_spec,status,model",
+                "id": f"eq.{execution_id}",
+                "limit": "1",
+            },
+        )
+        rows = response.data
+        if not isinstance(rows, list) or len(rows) == 0:
+            return None
+        return self._deserialize(rows[0])
+
+    async def get_pending_for_thread(
+        self, *, channel: str, thread_ts: str
+    ) -> ActionExecution | None:
+        response = await self._transport.request(
+            "GET",
+            self._TABLE,
+            query={
+                "select": "id,channel,thread_ts,user_id,original_request,generated_spec,status,model",
+                "channel": f"eq.{channel}",
+                "thread_ts": f"eq.{thread_ts}",
+                "status": "eq.pending",
+                "order": "id.desc",
+                "limit": "1",
+            },
+        )
+        rows = response.data
+        if not isinstance(rows, list) or len(rows) == 0:
+            return None
+        return self._deserialize(rows[0])
+
+    async def update_status(
+        self, execution_id: str, status: ActionExecutionStatus
+    ) -> None:
+        await self._transport.request(
+            "PATCH",
+            self._TABLE,
+            query={"id": f"eq.{execution_id}"},
+            json_body={"status": status},
+            headers={"Prefer": "return=minimal"},
+        )
+
+    @staticmethod
+    def _deserialize(row: JSONValue) -> ActionExecution:
+        data = _expect_mapping(row, "action_execution row")
+        return ActionExecution(
+            id=str(data["id"]),
+            channel=str(data["channel"]),
+            thread_ts=str(data["thread_ts"]),
+            user_id=_string_or_none(data.get("user_id")),
+            original_request=str(data["original_request"]),
+            generated_spec=str(data["generated_spec"]),
+            status=str(data.get("status", "pending")),  # type: ignore[arg-type]
+            model=_string_or_none(data.get("model")),
+        )
+
+
 class SupabasePersistenceRepository:
     def __init__(self, transport: AsyncSupabaseTransport) -> None:
         self._transport = transport
         self._thread_history = SlackThreadHistoryRepository(transport)
         self._documentation = DocumentationChunkRepository(transport)
         self._repo_config = RepositoryConfigRepository(transport)
+        self._action_executions = ActionExecutionRepository(transport)
 
     async def healthcheck(self) -> bool:
         try:
@@ -540,6 +629,26 @@ class SupabasePersistenceRepository:
         await self._repo_config.save_config(
             repo_path=repo_path, github_repository=github_repository,
         )
+
+    # -- Action execution persistence --
+
+    async def save_action_execution(self, execution: ActionExecution) -> None:
+        await self._action_executions.save(execution)
+
+    async def get_action_execution(self, execution_id: str) -> ActionExecution | None:
+        return await self._action_executions.get(execution_id)
+
+    async def get_pending_execution_for_thread(
+        self, *, channel: str, thread_ts: str
+    ) -> ActionExecution | None:
+        return await self._action_executions.get_pending_for_thread(
+            channel=channel, thread_ts=thread_ts,
+        )
+
+    async def update_action_execution_status(
+        self, execution_id: str, status: ActionExecutionStatus
+    ) -> None:
+        await self._action_executions.update_status(execution_id, status)
 
 
 async def _cohere_rerank(

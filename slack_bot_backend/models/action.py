@@ -7,6 +7,13 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
+# ---------------------------------------------------------------------------
+# Action execution status for the planner / approval flow
+# ---------------------------------------------------------------------------
+
+ActionExecutionStatus = Literal["pending", "approved", "rejected"]
+
+
 class ActionRequest(BaseModel):
     channel: str = Field(min_length=1)
     thread_ts: str = Field(min_length=1)
@@ -73,3 +80,20 @@ class EvaluationResult(BaseModel):
     clarifying_question: str | None = None
     optimized_prompt: str | None = None
     complexity_tier: Literal["simple", "complex"] = "simple"
+
+
+class ActionExecution(BaseModel):
+    """A persisted record for the planner-approval flow.
+
+    Created when the planner generates a spec for a complex task.
+    The human reviews and either approves or rejects via Slack buttons.
+    """
+
+    id: str
+    channel: str
+    thread_ts: str
+    user_id: str | None = None
+    original_request: str
+    generated_spec: str
+    status: ActionExecutionStatus = "pending"
+    model: str | None = None

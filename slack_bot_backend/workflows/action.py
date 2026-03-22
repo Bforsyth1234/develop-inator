@@ -8,11 +8,13 @@ import logging
 import os
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 
 from slack_bot_backend.models.action import (
+    ActionExecution,
     ActionRequest,
     ActionRouteResult,
     AiderResult,
@@ -105,6 +107,33 @@ purple shades). Tell Aider to explore the codebase to find the right files.
 User's request:
 {user_request}"""
 
+# ---------------------------------------------------------------------------
+# Planner (Expert Architect) prompt — used for complex tasks
+# ---------------------------------------------------------------------------
+
+_PLANNER_SYSTEM_PROMPT = """\
+You are an Expert Software Architect. You receive a developer's request \
+and (optionally) relevant code context retrieved from the repository.
+
+Your job is to produce a *step-by-step markdown implementation spec* that \
+a coding agent (Aider) can follow to implement the change safely.
+
+Rules:
+  1. Start with a one-line **Summary** of the change.
+  2. List every file that must be created or modified, with a brief \
+description of what changes in each.
+  3. Include code snippets or pseudo-code where helpful.
+  4. Call out edge cases, migrations, or test updates needed.
+  5. Use markdown formatting (headers, bullet lists, fenced code blocks).
+  6. Be precise and concise — the coding agent will follow your spec literally.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Developer's request:
+{user_request}
+
+{rag_context}"""
+
+
 class ActionGitOperations(Protocol):
     """Minimal git interface required by the action workflow."""
 
@@ -142,11 +171,20 @@ class ActionWorkflow:
             eval_result = await self._evaluate_request(request)
             if not eval_result.is_actionable:
                 return await self._handle_needs_clarification(request, eval_result)
+
             optimized_prompt = eval_result.optimized_prompt or request.request
             selected_model = self.model_tier_map.get(
                 eval_result.complexity_tier,
                 self.model_tier_map["simple"],
             )
+
+            # ── Complex task → invoke the Planner instead of Aider ──
+            if eval_result.complexity_tier == "complex":
+                return await self._handle_complex_plan(
+                    request, optimized_prompt=optimized_prompt, model=selected_model,
+                )
+
+            # ── Simple task → run Aider directly ──
             aider_result = await self._run_aider(
                 request, optimized_prompt=optimized_prompt, model=selected_model,
             )
@@ -227,6 +265,143 @@ class ActionWorkflow:
             provider="evaluator",
             message=message,
         )
+
+    # ------------------------------------------------------------------
+    # Complex-task planner
+    # ------------------------------------------------------------------
+
+    async def _handle_complex_plan(
+        self,
+        request: ActionRequest,
+        *,
+        optimized_prompt: str,
+        model: str,
+    ) -> ActionRouteResult:
+        """Invoke the Planner LLM, persist the spec, and post Block Kit buttons."""
+        await self._post_message(
+            request,
+            ":brain: This looks like a complex change — generating an implementation spec…",
+        )
+
+        planner_prompt = _PLANNER_SYSTEM_PROMPT.format(
+            user_request=optimized_prompt,
+            rag_context="",  # TODO: inject RAG context when available
+        )
+        llm_result = await self.llm.generate(planner_prompt)
+        spec = llm_result.content
+
+        # Persist the execution so we can hydrate state on button click
+        execution_id = uuid.uuid4().hex
+        execution = ActionExecution(
+            id=execution_id,
+            channel=request.channel,
+            thread_ts=request.thread_ts,
+            user_id=request.user_id,
+            original_request=optimized_prompt,
+            generated_spec=spec,
+            status="pending",
+            model=model,
+        )
+        if self.supabase is not None:
+            try:
+                await self.supabase.save_action_execution(execution)
+            except Exception:
+                logger.warning("Failed to persist action execution", exc_info=True)
+
+        # Post spec + approval buttons via Block Kit
+        blocks = self._build_spec_blocks(spec, execution_id)
+        try:
+            await self.slack.post_blocks(
+                request.channel,
+                blocks,
+                text="Implementation spec ready for review",
+                thread_ts=request.thread_ts,
+            )
+        except Exception:
+            logger.exception("Failed to post spec Block Kit message; falling back to plain text")
+            await self._post_message(request, f"*Implementation Spec:*\n\n{spec}")
+
+        return ActionRouteResult(
+            status="completed",
+            provider="planner",
+            message="Implementation spec posted for approval.",
+        )
+
+    async def generate_revised_spec(
+        self,
+        *,
+        old_spec: str,
+        user_feedback: str,
+        original_request: str,
+    ) -> str:
+        """Re-invoke the Planner with prior spec + user feedback to produce V2."""
+        prompt = (
+            _PLANNER_SYSTEM_PROMPT.format(
+                user_request=original_request,
+                rag_context="",
+            )
+            + f"\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Previous spec (V1):\n{old_spec}\n\n"
+            f"User feedback:\n{user_feedback}\n\n"
+            "Please produce an updated spec that incorporates the feedback."
+        )
+        llm_result = await self.llm.generate(prompt)
+        return llm_result.content
+
+    @staticmethod
+    def _split_text_into_chunks(text: str, max_len: int = 2900) -> list[str]:
+        """Split *text* into chunks of at most *max_len* characters, breaking at newlines."""
+        if len(text) <= max_len:
+            return [text]
+        chunks: list[str] = []
+        while text:
+            if len(text) <= max_len:
+                chunks.append(text)
+                break
+            # Try to break at the last newline before max_len
+            cut = text.rfind("\n", 0, max_len)
+            if cut <= 0:
+                cut = max_len
+            chunks.append(text[:cut])
+            text = text[cut:].lstrip("\n")
+        return chunks
+
+    @staticmethod
+    def _build_spec_blocks(spec: str, execution_id: str) -> list[dict]:
+        """Build Slack Block Kit blocks for the implementation spec with Approve/Reject buttons."""
+        blocks: list[dict] = [
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": ":clipboard: *Implementation Spec*"},
+            },
+        ]
+        # Split the spec across multiple section blocks (3000 char limit each)
+        for chunk in ActionWorkflow._split_text_into_chunks(spec):
+            blocks.append({
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": chunk},
+            })
+        blocks.append({"type": "divider"})
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": ":white_check_mark: Approve & Execute"},
+                    "style": "primary",
+                    "action_id": "approve_spec",
+                    "value": execution_id,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": ":x: Reject"},
+                    "style": "danger",
+                    "action_id": "reject_spec",
+                    "value": execution_id,
+                },
+            ],
+        })
+        return blocks
 
     # ------------------------------------------------------------------
     # Aider subprocess

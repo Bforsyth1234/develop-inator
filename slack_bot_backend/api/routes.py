@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import logging
 import time
+import urllib.parse
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from pydantic import ValidationError
@@ -189,3 +191,111 @@ async def handle_github_webhook(
     )
     background_tasks.add_task(container.indexer.reindex)
     return {"ok": True, "message": "re-index scheduled"}
+
+
+# ---------------------------------------------------------------------------
+# Slack interactive components (Block Kit buttons)
+# ---------------------------------------------------------------------------
+
+
+async def _handle_spec_action(
+    container: ServiceContainer,
+    payload: dict,
+    background_tasks: BackgroundTasks,
+) -> dict[str, object]:
+    """Process approve_spec / reject_spec button clicks."""
+    actions = payload.get("actions", [])
+    if not actions:
+        return {"ok": True}
+
+    action = actions[0]
+    action_id: str = action.get("action_id", "")
+    execution_id: str = action.get("value", "")
+
+    if not execution_id:
+        return {"ok": True}
+
+    execution = await container.supabase.get_action_execution(execution_id)
+    if execution is None:
+        logger.warning("Interaction for unknown execution %s", execution_id)
+        return {"ok": True}
+
+    if action_id == "approve_spec":
+        await container.supabase.update_action_execution_status(execution_id, "approved")
+
+        # Update the original Slack message to reflect approval
+        message_container = payload.get("container", {})
+        message_ts = message_container.get("message_ts", "")
+        if message_ts:
+            try:
+                await container.slack.update_message(
+                    execution.channel,
+                    message_ts,
+                    ":white_check_mark: Spec approved — executing…",
+                )
+            except Exception:
+                logger.warning("Could not update approval message", exc_info=True)
+
+        # Kick off Aider in the background with the approved spec as the prompt
+        async def _execute_approved() -> None:
+            from slack_bot_backend.models.action import ActionRequest as _AR
+            req = _AR(
+                channel=execution.channel,
+                thread_ts=execution.thread_ts,
+                request=execution.original_request,
+                user_id=execution.user_id,
+            )
+            await container.action._run_aider(
+                req,
+                optimized_prompt=execution.generated_spec,
+                model=execution.model or container.action.model_tier_map.get("complex", ""),
+            )
+
+        background_tasks.add_task(_execute_approved)
+        return {"ok": True}
+
+    if action_id == "reject_spec":
+        await container.supabase.update_action_execution_status(execution_id, "rejected")
+        message_container = payload.get("container", {})
+        message_ts = message_container.get("message_ts", "")
+        if message_ts:
+            try:
+                await container.slack.update_message(
+                    execution.channel,
+                    message_ts,
+                    ":x: Spec rejected. Reply in the thread with feedback to generate a new one.",
+                )
+            except Exception:
+                logger.warning("Could not update rejection message", exc_info=True)
+        return {"ok": True}
+
+    return {"ok": True}
+
+
+@router.post("/slack/interactions", tags=["slack"])
+async def handle_slack_interactions(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, object]:
+    """Handle Slack interactive component payloads (Block Kit buttons, etc.)."""
+    body = await request.body()
+    _verify_slack_signature(container.settings, request, body)
+
+    # Slack sends interaction payloads as application/x-www-form-urlencoded
+    # with a single `payload` field containing JSON.
+    decoded = urllib.parse.parse_qs(body.decode("utf-8"))
+    raw_payload = decoded.get("payload", [None])[0]
+    if not raw_payload:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing payload")
+
+    try:
+        payload = json.loads(raw_payload)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON payload") from exc
+
+    interaction_type = payload.get("type", "")
+    if interaction_type == "block_actions":
+        return await _handle_spec_action(container, payload, background_tasks)
+
+    return {"ok": True}

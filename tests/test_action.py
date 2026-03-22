@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from slack_bot_backend.config import Settings
 from slack_bot_backend.dependencies import ServiceContainer, get_container
 from slack_bot_backend.main import create_app
-from slack_bot_backend.models.action import ActionRequest, ActionRouteResult, ProposedFileChange, RepositorySearchResult
+from slack_bot_backend.models.action import ActionExecution, ActionExecutionStatus, ActionRequest, ActionRouteResult, ProposedFileChange, RepositorySearchResult
 from slack_bot_backend.services.github import GitHubGitService
 from slack_bot_backend.services.interfaces import LLMResult, PullRequestDraft
 from slack_bot_backend.services.stubs import StubGitService, StubLanguageModel, StubSlackGateway, StubSupabaseRepository
@@ -21,9 +21,21 @@ from slack_bot_backend.workflows import ActionWorkflow, IntentWorkflow, Question
 class FakeSlackGateway:
     def __init__(self) -> None:
         self.messages: list[dict[str, str | None]] = []
+        self.blocks_calls: list[dict] = []
+        self.update_calls: list[dict] = []
 
     async def post_message(self, channel: str, text: str, thread_ts: str | None = None) -> None:
         self.messages.append({"channel": channel, "text": text, "thread_ts": thread_ts})
+
+    async def post_blocks(
+        self, channel: str, blocks: list[dict], text: str = "", thread_ts: str | None = None,
+    ) -> None:
+        self.blocks_calls.append({"channel": channel, "blocks": blocks, "text": text, "thread_ts": thread_ts})
+
+    async def update_message(
+        self, channel: str, ts: str, text: str, blocks: list[dict] | None = None,
+    ) -> None:
+        self.update_calls.append({"channel": channel, "ts": ts, "text": text, "blocks": blocks})
 
 
 class FakeGitService:
@@ -88,6 +100,24 @@ class FakeSupabaseRepository:
         if self._fail_save:
             raise RuntimeError("Supabase unavailable")
         self.save_calls.append({"repo_path": repo_path, "github_repository": github_repository})
+
+    # -- Action execution persistence stubs --
+
+    async def save_action_execution(self, execution: ActionExecution) -> None:
+        pass
+
+    async def get_action_execution(self, execution_id: str) -> ActionExecution | None:
+        return None
+
+    async def get_pending_execution_for_thread(
+        self, *, channel: str, thread_ts: str
+    ) -> ActionExecution | None:
+        return None
+
+    async def update_action_execution_status(
+        self, execution_id: str, status: ActionExecutionStatus
+    ) -> None:
+        pass
 
 
 class FakeActionWorkflow:
@@ -451,8 +481,8 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
         model_idx = aider_cmd.index("--model") + 1
         self.assertEqual(aider_cmd[model_idx], "groq/llama-3.3-70b-versatile")
 
-    async def test_complex_tier_routes_to_anthropic_model(self) -> None:
-        """A 'complex' complexity_tier sends the Anthropic model to Aider."""
+    async def test_complex_tier_routes_to_planner(self) -> None:
+        """A 'complex' complexity_tier invokes the Planner instead of Aider directly."""
         slack = FakeSlackGateway()
         git = FakeGitService()
         llm = FakeLanguageModel(evaluator_json={
@@ -461,25 +491,38 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "optimized_prompt": "Refactor AuthService to use NgRx store for session state",
             "complexity_tier": "complex",
         })
-        captured_cmd: list[list[str]] = []
-        _delegate = _make_git_aware_side_effect()
 
-        async def capture_to_thread(_fn, cmd, **kwargs):
-            captured_cmd.append(cmd)
-            return await _delegate(_fn, cmd, **kwargs)
+        # The planner LLM call (second generate call) returns a spec string
+        call_count = 0
+        original_generate = llm.generate
 
-        with mock.patch(
-            "slack_bot_backend.workflows.action.asyncio.to_thread",
-            side_effect=capture_to_thread,
-        ):
-            result = await self._make_workflow(slack=slack, git=git, llm=llm).run(
-                ActionRequest(channel="C123", thread_ts="1710.2", request="Refactor auth to use NgRx")
-            )
+        async def patched_generate(prompt: str) -> LLMResult:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # First call is the evaluator
+                return await original_generate(prompt)
+            # Second call is the planner — return a markdown spec
+            return LLMResult(content="## Implementation Spec\n1. Refactor AuthService", provider="fake")
+
+        llm.generate = patched_generate
+
+        result = await self._make_workflow(slack=slack, git=git, llm=llm).run(
+            ActionRequest(channel="C123", thread_ts="1710.2", request="Refactor auth to use NgRx")
+        )
 
         self.assertEqual(result.status, "completed")
-        aider_cmd = [c for c in captured_cmd if c[0] != "git"][0]
-        model_idx = aider_cmd.index("--model") + 1
-        self.assertEqual(aider_cmd[model_idx], "anthropic/claude-sonnet-4-20250514")
+        self.assertEqual(result.provider, "planner")
+        # Should have posted a "generating spec" message + Block Kit blocks
+        self.assertTrue(len(slack.messages) >= 1)
+        self.assertIn("complex", slack.messages[0]["text"])
+        self.assertEqual(len(slack.blocks_calls), 1)
+        blocks = slack.blocks_calls[0]["blocks"]
+        # Should have approve/reject buttons
+        action_block = [b for b in blocks if b.get("type") == "actions"][0]
+        action_ids = [e["action_id"] for e in action_block["elements"]]
+        self.assertIn("approve_spec", action_ids)
+        self.assertIn("reject_spec", action_ids)
 
     async def test_aider_subprocess_receives_env_with_api_keys(self) -> None:
         """The Aider subprocess env includes GROQ_API_KEY and ANTHROPIC_API_KEY."""

@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from slack_bot_backend.config import Settings
 from slack_bot_backend.dependencies import ServiceContainer, get_container
 from slack_bot_backend.main import create_app
-from slack_bot_backend.models.action import ActionRouteResult
+from slack_bot_backend.models.action import ActionExecution, ActionExecutionStatus, ActionRouteResult
 from slack_bot_backend.models.persistence import DocumentationMatch, SlackThreadMessageRecord
 from slack_bot_backend.models.slack import SlackEvent, SlackEventEnvelope
 from slack_bot_backend.services.interfaces import EmbeddingResult, LLMResult
@@ -20,9 +20,21 @@ from slack_bot_backend.workflows import ConfigureWorkflow, IntentWorkflow, Quest
 class FakeSlackGateway:
     def __init__(self) -> None:
         self.messages: list[dict[str, str | None]] = []
+        self.blocks_calls: list[dict] = []
+        self.update_calls: list[dict] = []
 
     async def post_message(self, channel: str, text: str, thread_ts: str | None = None) -> None:
         self.messages.append({"channel": channel, "text": text, "thread_ts": thread_ts})
+
+    async def post_blocks(
+        self, channel: str, blocks: list[dict], text: str = "", thread_ts: str | None = None,
+    ) -> None:
+        self.blocks_calls.append({"channel": channel, "blocks": blocks, "text": text, "thread_ts": thread_ts})
+
+    async def update_message(
+        self, channel: str, ts: str, text: str, blocks: list[dict] | None = None,
+    ) -> None:
+        self.update_calls.append({"channel": channel, "ts": ts, "text": text, "blocks": blocks})
 
 
 class FakeSupabaseRepository:
@@ -62,6 +74,22 @@ class FakeSupabaseRepository:
 
     async def save_repository_config(self, *, repo_path: str, github_repository: str) -> None:
         self.saved_configs.append({"repo_path": repo_path, "github_repository": github_repository})
+
+    async def save_action_execution(self, execution: ActionExecution) -> None:
+        pass
+
+    async def get_action_execution(self, execution_id: str) -> ActionExecution | None:
+        return None
+
+    async def get_pending_execution_for_thread(
+        self, *, channel: str, thread_ts: str
+    ) -> ActionExecution | None:
+        return None
+
+    async def update_action_execution_status(
+        self, execution_id: str, status: ActionExecutionStatus
+    ) -> None:
+        pass
 
 
 class FakeLanguageModel:

@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-from slack_bot_backend.models.action import ProposedFileChange, RepositorySearchResult
+from slack_bot_backend.models.action import ActionExecution, ActionExecutionStatus, ProposedFileChange, RepositorySearchResult
 from slack_bot_backend.models.persistence import DocumentationMatch, JSONValue, SlackThreadMessageRecord
 
 if TYPE_CHECKING:
@@ -35,6 +35,22 @@ class PullRequestDraft:
 class SlackGateway(Protocol):
     async def post_message(self, channel: str, text: str, thread_ts: str | None = None) -> None: ...
 
+    async def post_blocks(
+        self,
+        channel: str,
+        blocks: list[dict],
+        text: str = "",
+        thread_ts: str | None = None,
+    ) -> None: ...
+
+    async def update_message(
+        self,
+        channel: str,
+        ts: str,
+        text: str,
+        blocks: list[dict] | None = None,
+    ) -> None: ...
+
 
 class SupabaseRepository(Protocol):
     async def healthcheck(self) -> bool: ...
@@ -57,6 +73,20 @@ class SupabaseRepository(Protocol):
 
     async def save_repository_config(
         self, *, repo_path: str, github_repository: str
+    ) -> None: ...
+
+    # -- Action execution persistence (planner / approval flow) --
+
+    async def save_action_execution(self, execution: ActionExecution) -> None: ...
+
+    async def get_action_execution(self, execution_id: str) -> ActionExecution | None: ...
+
+    async def get_pending_execution_for_thread(
+        self, *, channel: str, thread_ts: str
+    ) -> ActionExecution | None: ...
+
+    async def update_action_execution_status(
+        self, execution_id: str, status: ActionExecutionStatus
     ) -> None: ...
 
 

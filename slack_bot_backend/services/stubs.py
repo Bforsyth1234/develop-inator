@@ -6,7 +6,7 @@ import json
 import logging
 from collections.abc import Sequence
 
-from slack_bot_backend.models.action import ProposedFileChange, RepositorySearchResult
+from slack_bot_backend.models.action import ActionExecution, ActionExecutionStatus, ProposedFileChange, RepositorySearchResult
 from slack_bot_backend.models.persistence import DocumentationMatch, JSONValue, SlackThreadMessageRecord
 from slack_bot_backend.services.supabase_persistence import RepositoryConfig
 
@@ -28,6 +28,30 @@ class StubSlackGateway(SlackGateway):
         logger.info(
             "Stub Slack gateway invoked",
             extra={"channel": channel, "thread_ts": thread_ts, "text": text},
+        )
+
+    async def post_blocks(
+        self,
+        channel: str,
+        blocks: list[dict],
+        text: str = "",
+        thread_ts: str | None = None,
+    ) -> None:
+        logger.info(
+            "Stub Slack post_blocks invoked",
+            extra={"channel": channel, "thread_ts": thread_ts, "block_count": len(blocks)},
+        )
+
+    async def update_message(
+        self,
+        channel: str,
+        ts: str,
+        text: str,
+        blocks: list[dict] | None = None,
+    ) -> None:
+        logger.info(
+            "Stub Slack update_message invoked",
+            extra={"channel": channel, "ts": ts},
         )
 
 
@@ -75,6 +99,27 @@ class StubSupabaseRepository(SupabaseRepository):
         logger.info(
             "Stub Supabase save_repository_config invoked",
             extra={"repo_path": repo_path, "github_repository": github_repository},
+        )
+
+    async def save_action_execution(self, execution: ActionExecution) -> None:
+        logger.info("Stub save_action_execution invoked", extra={"id": execution.id})
+
+    async def get_action_execution(self, execution_id: str) -> ActionExecution | None:
+        logger.info("Stub get_action_execution invoked", extra={"id": execution_id})
+        return None
+
+    async def get_pending_execution_for_thread(
+        self, *, channel: str, thread_ts: str
+    ) -> ActionExecution | None:
+        logger.info("Stub get_pending_execution_for_thread invoked")
+        return None
+
+    async def update_action_execution_status(
+        self, execution_id: str, status: ActionExecutionStatus
+    ) -> None:
+        logger.info(
+            "Stub update_action_execution_status invoked",
+            extra={"id": execution_id, "status": status},
         )
 
 

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import logging
 import time
+import urllib.parse
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from pydantic import ValidationError
@@ -156,17 +158,29 @@ async def handle_github_webhook(
     if event_type == "ping":
         return {"ok": True, "message": "pong"}
 
-    if event_type != "push":
-        return {"ok": True, "message": f"ignored event: {event_type}"}
-
-    import json as _json
-
     try:
-        payload = _json.loads(body)
+        payload = json.loads(body)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON payload"
         ) from exc
+
+    # ── Handle PR comment events ──
+    if event_type == "issue_comment":
+        return await _handle_issue_comment(payload, container, background_tasks)
+
+    if event_type == "pull_request_review_comment":
+        return await _handle_review_comment(payload, container, background_tasks)
+
+    if event_type == "pull_request_review":
+        # Review-level events are typically summaries ("Review completed.
+        # 3 suggestions posted.") that duplicate the inline comments we
+        # already handle via pull_request_review_comment.  Skip them to
+        # avoid duplicate / non-actionable Aider runs.
+        return {"ok": True, "message": "pull_request_review events are handled via individual review comments"}
+
+    if event_type != "push":
+        return {"ok": True, "message": f"ignored event: {event_type}"}
 
     ref: str = payload.get("ref", "")
     default_branch = payload.get("repository", {}).get("default_branch", "main")
@@ -189,3 +203,242 @@ async def handle_github_webhook(
     )
     background_tasks.add_task(container.indexer.reindex)
     return {"ok": True, "message": "re-index scheduled"}
+
+
+# ---------------------------------------------------------------------------
+# GitHub issue_comment handler (PR comment feedback loop)
+# ---------------------------------------------------------------------------
+
+
+async def _handle_issue_comment(
+    payload: dict,
+    container: ServiceContainer,
+    background_tasks: BackgroundTasks,
+) -> dict[str, object]:
+    """Dispatch a GitHub ``issue_comment`` event if it's on a PR we created."""
+    # Only handle newly created comments
+    if payload.get("action") != "created":
+        return {"ok": True, "message": "ignored non-created comment action"}
+
+    # Must be a PR (not a plain issue)
+    issue = payload.get("issue", {})
+    pr_data = issue.get("pull_request")
+    if not pr_data:
+        return {"ok": True, "message": "ignored comment on non-PR issue"}
+
+    # Ignore comments made by the bot itself
+    sender_login: str = payload.get("sender", {}).get("login", "")
+    if sender_login == container.settings.github_bot_username:
+        return {"ok": True, "message": "ignored bot's own comment"}
+
+    comment_body: str = payload.get("comment", {}).get("body", "")
+    pr_url: str = pr_data.get("html_url", "") or issue.get("html_url", "")
+
+    if not comment_body or not pr_url:
+        return {"ok": True, "message": "missing comment body or PR URL"}
+
+    logger.info(
+        "GitHub PR comment received — dispatching handler",
+        extra={"pr_url": pr_url, "sender": sender_login},
+    )
+
+    background_tasks.add_task(
+        container.action.handle_pr_comment,
+        pr_url=pr_url,
+        comment_body=comment_body,
+        sender=sender_login,
+    )
+    return {"ok": True, "message": "pr comment handler scheduled"}
+
+
+# ---------------------------------------------------------------------------
+# GitHub pull_request_review_comment handler (inline code review comments)
+# ---------------------------------------------------------------------------
+
+
+async def _handle_review_comment(
+    payload: dict,
+    container: ServiceContainer,
+    background_tasks: BackgroundTasks,
+) -> dict[str, object]:
+    """Dispatch a GitHub ``pull_request_review_comment`` event (inline code comment)."""
+    if payload.get("action") != "created":
+        return {"ok": True, "message": "ignored non-created review comment action"}
+
+    sender_login: str = payload.get("sender", {}).get("login", "")
+    if sender_login == container.settings.github_bot_username:
+        return {"ok": True, "message": "ignored bot's own review comment"}
+
+    comment = payload.get("comment", {})
+    comment_body: str = comment.get("body", "")
+    comment_node_id: str = comment.get("node_id", "")
+    diff_hunk: str = comment.get("diff_hunk", "")
+    path: str = comment.get("path", "")
+
+    pr_url: str = payload.get("pull_request", {}).get("html_url", "")
+    if not comment_body or not pr_url:
+        return {"ok": True, "message": "missing comment body or PR URL"}
+
+    # Include file context so the bot understands _where_ the comment applies
+    enriched_body = comment_body
+    if path:
+        enriched_body = f"[{path}]\n{comment_body}"
+    if diff_hunk:
+        enriched_body = f"{enriched_body}\n\nRelevant diff:\n```\n{diff_hunk}\n```"
+
+    logger.info(
+        "GitHub PR inline review comment received",
+        extra={"pr_url": pr_url, "sender": sender_login, "path": path},
+    )
+
+    background_tasks.add_task(
+        container.action.handle_pr_comment,
+        pr_url=pr_url,
+        comment_body=enriched_body,
+        sender=sender_login,
+        comment_node_id=comment_node_id or None,
+    )
+    return {"ok": True, "message": "pr review comment handler scheduled"}
+
+
+# ---------------------------------------------------------------------------
+# Slack interactive components (Block Kit buttons)
+# ---------------------------------------------------------------------------
+
+
+async def _handle_spec_action(
+    container: ServiceContainer,
+    payload: dict,
+    background_tasks: BackgroundTasks,
+) -> dict[str, object]:
+    """Process approve_spec / reject_spec button clicks."""
+    actions = payload.get("actions", [])
+    if not actions:
+        return {"ok": True}
+
+    action = actions[0]
+    action_id: str = action.get("action_id", "")
+    execution_id: str = action.get("value", "")
+
+    if not execution_id:
+        return {"ok": True}
+
+    execution = await container.supabase.get_action_execution(execution_id)
+    if execution is None:
+        logger.warning("Interaction for unknown execution %s", execution_id)
+        return {"ok": True}
+
+    if action_id == "approve_spec":
+        await container.supabase.update_action_execution_status(execution_id, "approved")
+
+        # Update the original Slack message to reflect approval
+        message_container = payload.get("container", {})
+        message_ts = message_container.get("message_ts", "")
+        if message_ts:
+            try:
+                await container.slack.update_message(
+                    execution.channel,
+                    message_ts,
+                    ":white_check_mark: Spec approved — executing…",
+                )
+            except Exception:
+                logger.warning("Could not update approval message", exc_info=True)
+
+        # Kick off Aider in the background with the approved spec as the prompt.
+        # If this thread is associated with an existing PR branch (e.g. from
+        # a PR comment feedback loop), push to that branch instead of creating
+        # a new one.
+        async def _execute_approved() -> None:
+            from slack_bot_backend.models.action import ActionRequest as _AR
+            req = _AR(
+                channel=execution.channel,
+                thread_ts=execution.thread_ts,
+                request=execution.original_request,
+                user_id=execution.user_id,
+            )
+            # Check for an existing PR branch linked to this thread
+            existing_branch: str | None = None
+            try:
+                mapping = await container.supabase.get_pr_mapping_by_thread(
+                    channel_id=execution.channel,
+                    thread_ts=execution.thread_ts,
+                )
+                if mapping is not None:
+                    existing_branch = mapping.branch_name
+            except Exception:
+                logger.warning("Could not look up PR mapping for thread", exc_info=True)
+
+            selected_model = execution.model or container.action.model_tier_map.get("complex", "")
+            try:
+                aider_result = await container.action._run_aider(
+                    req,
+                    optimized_prompt=execution.generated_spec,
+                    model=selected_model,
+                    existing_branch=existing_branch,
+                )
+                if aider_result.returncode != 0:
+                    if aider_result.test_attempts > 0:
+                        await container.action._handle_test_failure(req, aider_result)
+                    else:
+                        await container.action._handle_failure(req, aider_result)
+                else:
+                    await container.action._handle_success(req, aider_result, model=selected_model)
+            except Exception:
+                logger.exception("Approved spec execution failed")
+                try:
+                    await container.slack.post_message(
+                        execution.channel,
+                        ":x: I hit an error executing the approved spec. Please check the logs.",
+                        thread_ts=execution.thread_ts,
+                    )
+                except Exception:
+                    logger.warning("Failed to post error to Slack", exc_info=True)
+
+        background_tasks.add_task(_execute_approved)
+        return {"ok": True}
+
+    if action_id == "reject_spec":
+        await container.supabase.update_action_execution_status(execution_id, "rejected")
+        message_container = payload.get("container", {})
+        message_ts = message_container.get("message_ts", "")
+        if message_ts:
+            try:
+                await container.slack.update_message(
+                    execution.channel,
+                    message_ts,
+                    ":x: Spec rejected. Reply in the thread with feedback to generate a new one.",
+                )
+            except Exception:
+                logger.warning("Could not update rejection message", exc_info=True)
+        return {"ok": True}
+
+    return {"ok": True}
+
+
+@router.post("/slack/interactions", tags=["slack"])
+async def handle_slack_interactions(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, object]:
+    """Handle Slack interactive component payloads (Block Kit buttons, etc.)."""
+    body = await request.body()
+    _verify_slack_signature(container.settings, request, body)
+
+    # Slack sends interaction payloads as application/x-www-form-urlencoded
+    # with a single `payload` field containing JSON.
+    decoded = urllib.parse.parse_qs(body.decode("utf-8"))
+    raw_payload = decoded.get("payload", [None])[0]
+    if not raw_payload:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing payload")
+
+    try:
+        payload = json.loads(raw_payload)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON payload") from exc
+
+    interaction_type = payload.get("type", "")
+    if interaction_type == "block_actions":
+        return await _handle_spec_action(container, payload, background_tasks)
+
+    return {"ok": True}

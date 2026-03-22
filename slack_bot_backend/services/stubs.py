@@ -6,8 +6,8 @@ import json
 import logging
 from collections.abc import Sequence
 
-from slack_bot_backend.models.action import ProposedFileChange, RepositorySearchResult
-from slack_bot_backend.models.persistence import DocumentationMatch, JSONValue, SlackThreadMessageRecord
+from slack_bot_backend.models.action import ActionExecution, ActionExecutionStatus, ProposedFileChange, RepositorySearchResult
+from slack_bot_backend.models.persistence import ActivePullRequestRecord, DocumentationMatch, JSONValue, SlackThreadMessageRecord
 from slack_bot_backend.services.supabase_persistence import RepositoryConfig
 
 from .interfaces import (
@@ -30,6 +30,30 @@ class StubSlackGateway(SlackGateway):
             extra={"channel": channel, "thread_ts": thread_ts, "text": text},
         )
 
+    async def post_blocks(
+        self,
+        channel: str,
+        blocks: list[dict],
+        text: str = "",
+        thread_ts: str | None = None,
+    ) -> None:
+        logger.info(
+            "Stub Slack post_blocks invoked",
+            extra={"channel": channel, "thread_ts": thread_ts, "block_count": len(blocks)},
+        )
+
+    async def update_message(
+        self,
+        channel: str,
+        ts: str,
+        text: str,
+        blocks: list[dict] | None = None,
+    ) -> None:
+        logger.info(
+            "Stub Slack update_message invoked",
+            extra={"channel": channel, "ts": ts},
+        )
+
 
 class StubSupabaseRepository(SupabaseRepository):
     async def healthcheck(self) -> bool:
@@ -49,6 +73,7 @@ class StubSupabaseRepository(SupabaseRepository):
         self,
         query_embedding: tuple[float, ...],
         *,
+        query_text: str = "",
         limit: int = 5,
         min_similarity: float = 0.0,
         metadata_filter: dict[str, JSONValue] | None = None,
@@ -75,6 +100,40 @@ class StubSupabaseRepository(SupabaseRepository):
             "Stub Supabase save_repository_config invoked",
             extra={"repo_path": repo_path, "github_repository": github_repository},
         )
+
+    async def save_action_execution(self, execution: ActionExecution) -> None:
+        logger.info("Stub save_action_execution invoked", extra={"id": execution.id})
+
+    async def get_action_execution(self, execution_id: str) -> ActionExecution | None:
+        logger.info("Stub get_action_execution invoked", extra={"id": execution_id})
+        return None
+
+    async def get_pending_execution_for_thread(
+        self, *, channel: str, thread_ts: str
+    ) -> ActionExecution | None:
+        logger.info("Stub get_pending_execution_for_thread invoked")
+        return None
+
+    async def update_action_execution_status(
+        self, execution_id: str, status: ActionExecutionStatus
+    ) -> None:
+        logger.info(
+            "Stub update_action_execution_status invoked",
+            extra={"id": execution_id, "status": status},
+        )
+
+    async def save_pr_mapping(self, record: ActivePullRequestRecord) -> None:
+        logger.info("Stub save_pr_mapping invoked", extra={"pr_url": record.pr_url})
+
+    async def get_pr_mapping_by_url(self, pr_url: str) -> ActivePullRequestRecord | None:
+        logger.info("Stub get_pr_mapping_by_url invoked", extra={"pr_url": pr_url})
+        return None
+
+    async def get_pr_mapping_by_thread(
+        self, *, channel_id: str, thread_ts: str
+    ) -> ActivePullRequestRecord | None:
+        logger.info("Stub get_pr_mapping_by_thread invoked", extra={"channel_id": channel_id})
+        return None
 
 
 class StubLanguageModel(LanguageModel):
@@ -173,3 +232,9 @@ class StubGitService(GitService):
             },
         )
         return "stub-pr-url"
+
+    async def resolve_review_thread(self, pr_url: str, comment_node_id: str) -> None:
+        logger.info(
+            "Stub resolve_review_thread invoked",
+            extra={"pr_url": pr_url, "comment_node_id": comment_node_id},
+        )

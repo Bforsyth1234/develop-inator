@@ -1,6 +1,14 @@
+import json
 import unittest
+from unittest.mock import patch
 
-from slack_bot_backend.models.persistence import DocumentationChunkRecord, EmbeddingMetadata, SlackThreadMessageRecord
+from slack_bot_backend.config import Settings
+from slack_bot_backend.models.persistence import (
+    DocumentationChunkRecord,
+    DocumentationMatch,
+    EmbeddingMetadata,
+    SlackThreadMessageRecord,
+)
 from slack_bot_backend.services.supabase_persistence import (
     DocumentationChunkRepository,
     RepositoryConfigRepository,
@@ -8,6 +16,7 @@ from slack_bot_backend.services.supabase_persistence import (
     SupabasePersistenceRepository,
     SupabasePersistenceError,
     SupabaseResponse,
+    _cohere_rerank,
 )
 
 
@@ -170,12 +179,18 @@ class DocumentationChunkRepositoryTests(unittest.IsolatedAsyncioTestCase):
         )
         repository = DocumentationChunkRepository(transport)
 
-        matches = await repository.match_chunks((0.3, 0.2, 0.1), limit=3, min_similarity=0.75)
+        matches = await repository.match_chunks(
+            (0.3, 0.2, 0.1), query_text="test query", limit=3, min_similarity=0.75,
+        )
 
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0].similarity, 0.91)
         self.assertEqual(transport.calls[0]["path"], "rest/v1/rpc/match_documentation_chunks")
-        self.assertEqual(transport.calls[0]["json_body"]["query_embedding"], "[0.3,0.2,0.1]")
+        body = transport.calls[0]["json_body"]
+        self.assertEqual(body["query_embedding"], "[0.3,0.2,0.1]")
+        # The RPC always fetches 20 candidates for reranking.
+        self.assertEqual(body["match_count"], 20)
+        self.assertEqual(body["query_text"], "test query")
 
     async def test_match_chunks_wraps_transport_failures(self):
         transport = RecordingTransport(
@@ -483,6 +498,206 @@ class SupabasePersistenceRepositoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call["method"], "POST")
         self.assertEqual(call["path"], "rest/v1/repository_config")
         self.assertEqual(call["json_body"]["repo_path"], "/srv/app")
+
+
+def _make_match(content: str, similarity: float = 0.9, index: int = 0) -> DocumentationMatch:
+    """Helper to build a minimal DocumentationMatch for rerank tests."""
+    return DocumentationMatch(
+        source_type="note",
+        source_id=f"doc-{index}",
+        chunk_index=index,
+        content=content,
+        similarity=similarity,
+    )
+
+
+def _settings_without_cohere(**overrides: object) -> Settings:
+    """Return a Settings instance with Cohere disabled (no API key)."""
+    return Settings.model_validate({"cohere_api_key": None, **overrides})
+
+
+def _settings_with_cohere(**overrides: object) -> Settings:
+    """Return a Settings instance with a fake Cohere API key."""
+    return Settings.model_validate(
+        {"cohere_api_key": "test-cohere-key", **overrides}
+    )
+
+
+class CohereRerankTests(unittest.IsolatedAsyncioTestCase):
+    """Tests for the _cohere_rerank helper function."""
+
+    # ------------------------------------------------------------------
+    # Graceful degradation (no Cohere call expected)
+    # ------------------------------------------------------------------
+
+    async def test_returns_first_top_n_when_no_api_key(self):
+        candidates = [_make_match(f"chunk-{i}", index=i) for i in range(10)]
+        with patch(
+            "slack_bot_backend.services.supabase_persistence.get_settings",
+            return_value=_settings_without_cohere(),
+        ):
+            result = await _cohere_rerank("some query", candidates, top_n=3)
+
+        self.assertEqual(len(result), 3)
+        self.assertEqual([m.content for m in result], ["chunk-0", "chunk-1", "chunk-2"])
+
+    async def test_returns_first_top_n_when_query_is_empty(self):
+        candidates = [_make_match(f"chunk-{i}", index=i) for i in range(10)]
+        with patch(
+            "slack_bot_backend.services.supabase_persistence.get_settings",
+            return_value=_settings_with_cohere(),
+        ):
+            result = await _cohere_rerank("", candidates, top_n=3)
+
+        self.assertEqual(len(result), 3)
+
+    async def test_returns_empty_list_when_candidates_empty(self):
+        with patch(
+            "slack_bot_backend.services.supabase_persistence.get_settings",
+            return_value=_settings_with_cohere(),
+        ):
+            result = await _cohere_rerank("query", [], top_n=5)
+
+        self.assertEqual(result, [])
+
+    # ------------------------------------------------------------------
+    # Successful reranking
+    # ------------------------------------------------------------------
+
+    async def test_reorders_candidates_based_on_cohere_response(self):
+        candidates = [_make_match(f"chunk-{i}", index=i) for i in range(5)]
+
+        # Cohere returns indices in a different order (best first).
+        fake_cohere_response = json.dumps(
+            {"results": [{"index": 3}, {"index": 0}, {"index": 4}]}
+        ).encode("utf-8")
+
+        class FakeResponse:
+            def read(self):
+                return fake_cohere_response
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        with (
+            patch(
+                "slack_bot_backend.services.supabase_persistence.get_settings",
+                return_value=_settings_with_cohere(),
+            ),
+            patch(
+                "slack_bot_backend.services.supabase_persistence.request.urlopen",
+                return_value=FakeResponse(),
+            ),
+        ):
+            result = await _cohere_rerank("my query", candidates, top_n=3)
+
+        self.assertEqual(len(result), 3)
+        self.assertEqual(result[0].content, "chunk-3")
+        self.assertEqual(result[1].content, "chunk-0")
+        self.assertEqual(result[2].content, "chunk-4")
+
+    async def test_sends_correct_payload_to_cohere(self):
+        candidates = [_make_match("hello world", index=0)]
+        captured_request = {}
+
+        class FakeResponse:
+            def read(self):
+                return json.dumps({"results": [{"index": 0}]}).encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        def fake_urlopen(req, timeout=None):
+            captured_request["url"] = req.full_url
+            captured_request["body"] = json.loads(req.data.decode("utf-8"))
+            captured_request["headers"] = dict(req.headers)
+            return FakeResponse()
+
+        with (
+            patch(
+                "slack_bot_backend.services.supabase_persistence.get_settings",
+                return_value=_settings_with_cohere(),
+            ),
+            patch(
+                "slack_bot_backend.services.supabase_persistence.request.urlopen",
+                side_effect=fake_urlopen,
+            ),
+        ):
+            await _cohere_rerank("search terms", candidates, top_n=5)
+
+        self.assertEqual(captured_request["url"], "https://api.cohere.com/v1/rerank")
+        body = captured_request["body"]
+        self.assertEqual(body["query"], "search terms")
+        self.assertEqual(body["documents"], ["hello world"])
+        self.assertEqual(body["top_n"], 5)
+        self.assertFalse(body["return_documents"])
+        self.assertEqual(body["model"], "rerank-english-v3.0")
+        self.assertEqual(
+            captured_request["headers"]["Authorization"], "Bearer test-cohere-key"
+        )
+
+    # ------------------------------------------------------------------
+    # Failure / edge-case handling
+    # ------------------------------------------------------------------
+
+    async def test_falls_back_on_cohere_api_error(self):
+        candidates = [_make_match(f"chunk-{i}", index=i) for i in range(6)]
+
+        with (
+            patch(
+                "slack_bot_backend.services.supabase_persistence.get_settings",
+                return_value=_settings_with_cohere(),
+            ),
+            patch(
+                "slack_bot_backend.services.supabase_persistence.request.urlopen",
+                side_effect=ConnectionError("network down"),
+            ),
+        ):
+            result = await _cohere_rerank("query", candidates, top_n=3)
+
+        # Falls back to first top_n in original order.
+        self.assertEqual(len(result), 3)
+        self.assertEqual([m.content for m in result], ["chunk-0", "chunk-1", "chunk-2"])
+
+    async def test_ignores_out_of_range_indices(self):
+        candidates = [_make_match(f"chunk-{i}", index=i) for i in range(3)]
+
+        fake_cohere_response = json.dumps(
+            {"results": [{"index": 2}, {"index": 99}, {"index": 0}]}
+        ).encode("utf-8")
+
+        class FakeResponse:
+            def read(self):
+                return fake_cohere_response
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        with (
+            patch(
+                "slack_bot_backend.services.supabase_persistence.get_settings",
+                return_value=_settings_with_cohere(),
+            ),
+            patch(
+                "slack_bot_backend.services.supabase_persistence.request.urlopen",
+                return_value=FakeResponse(),
+            ),
+        ):
+            result = await _cohere_rerank("query", candidates, top_n=5)
+
+        # Index 99 is silently skipped.
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0].content, "chunk-2")
+        self.assertEqual(result[1].content, "chunk-0")
 
 
 if __name__ == "__main__":

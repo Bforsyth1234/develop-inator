@@ -302,48 +302,6 @@ async def _handle_review_comment(
 
 
 # ---------------------------------------------------------------------------
-# GitHub pull_request_review handler (review-level summary comments)
-# ---------------------------------------------------------------------------
-
-
-async def _handle_pull_request_review(
-    payload: dict,
-    container: ServiceContainer,
-    background_tasks: BackgroundTasks,
-) -> dict[str, object]:
-    """Dispatch a GitHub ``pull_request_review`` event (review submitted)."""
-    if payload.get("action") != "submitted":
-        return {"ok": True, "message": "ignored non-submitted review action"}
-
-    sender_login: str = payload.get("sender", {}).get("login", "")
-    if sender_login == container.settings.github_bot_username:
-        return {"ok": True, "message": "ignored bot's own review"}
-
-    review = payload.get("review", {})
-    review_body: str = review.get("body", "") or ""
-    review_state: str = review.get("state", "")  # commented, approved, changes_requested
-
-    pr_url: str = payload.get("pull_request", {}).get("html_url", "")
-
-    # Only act on reviews that have a body (skip empty approvals)
-    if not review_body.strip() or not pr_url:
-        return {"ok": True, "message": "ignored review with no body or missing PR URL"}
-
-    logger.info(
-        "GitHub PR review received",
-        extra={"pr_url": pr_url, "sender": sender_login, "state": review_state},
-    )
-
-    background_tasks.add_task(
-        container.action.handle_pr_comment,
-        pr_url=pr_url,
-        comment_body=review_body,
-        sender=sender_login,
-    )
-    return {"ok": True, "message": "pr review handler scheduled"}
-
-
-# ---------------------------------------------------------------------------
 # Slack interactive components (Block Kit buttons)
 # ---------------------------------------------------------------------------
 

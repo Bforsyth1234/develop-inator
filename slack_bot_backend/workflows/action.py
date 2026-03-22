@@ -162,6 +162,16 @@ class ActionWorkflow:
         self.supabase = supabase
         self.model_tier_map: dict[str, str] = dict(model_tier_map or _MODEL_TIER_MAP)
         self.aider_bin = aider_bin
+        # Per-branch locks to serialize concurrent Aider runs.
+        # When multiple review comments arrive at the same time for the
+        # same branch, only one Aider process runs at a time; the rest queue.
+        self._branch_locks: dict[str, asyncio.Lock] = {}
+
+    def _branch_lock(self, branch_name: str) -> asyncio.Lock:
+        """Return (and lazily create) an ``asyncio.Lock`` for *branch_name*."""
+        if branch_name not in self._branch_locks:
+            self._branch_locks[branch_name] = asyncio.Lock()
+        return self._branch_locks[branch_name]
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -295,57 +305,60 @@ class ActionWorkflow:
             return
 
         # 5. Simple → run Aider on existing branch
-        try:
-            aider_result = await self._run_aider(
-                synthetic_request,
-                optimized_prompt=optimized_prompt,
-                model=selected_model,
-                existing_branch=branch_name,
-            )
-        except Exception:
-            logger.exception("Aider run failed for PR comment feedback")
+        #    Acquire a per-branch lock so concurrent review comments for the
+        #    same branch are serialized instead of fighting over git locks.
+        async with self._branch_lock(branch_name):
+            try:
+                aider_result = await self._run_aider(
+                    synthetic_request,
+                    optimized_prompt=optimized_prompt,
+                    model=selected_model,
+                    existing_branch=branch_name,
+                )
+            except Exception:
+                logger.exception("Aider run failed for PR comment feedback")
+                try:
+                    await self.slack.post_message(
+                        channel_id,
+                        ":x: I hit an error trying to address the PR comment. Please check the logs.",
+                        thread_ts=thread_ts,
+                    )
+                except Exception:
+                    logger.warning("Failed to post error to Slack", exc_info=True)
+                return
+
+            if aider_result.returncode != 0:
+                stderr_snippet = aider_result.stderr[-500:] or "(empty)"
+                try:
+                    await self.slack.post_message(
+                        channel_id,
+                        f":x: Aider couldn't apply the fix (exit {aider_result.returncode}).\n"
+                        f"```\n{stderr_snippet}\n```",
+                        thread_ts=thread_ts,
+                    )
+                except Exception:
+                    logger.warning("Failed to post failure to Slack", exc_info=True)
+                return
+
+            # 6. Resolve the review thread on GitHub if we have a comment node ID
+            if comment_node_id:
+                try:
+                    await self.git.resolve_review_thread(pr_url, comment_node_id)
+                except Exception:
+                    logger.warning(
+                        "Failed to resolve review thread on GitHub",
+                        extra={"comment_node_id": comment_node_id},
+                        exc_info=True,
+                    )
+
             try:
                 await self.slack.post_message(
                     channel_id,
-                    ":x: I hit an error trying to address the PR comment. Please check the logs.",
+                    ":white_check_mark: I've pushed a fix for your comment to the PR.",
                     thread_ts=thread_ts,
                 )
             except Exception:
-                logger.warning("Failed to post error to Slack", exc_info=True)
-            return
-
-        if aider_result.returncode != 0:
-            stderr_snippet = aider_result.stderr[-500:] or "(empty)"
-            try:
-                await self.slack.post_message(
-                    channel_id,
-                    f":x: Aider couldn't apply the fix (exit {aider_result.returncode}).\n"
-                    f"```\n{stderr_snippet}\n```",
-                    thread_ts=thread_ts,
-                )
-            except Exception:
-                logger.warning("Failed to post failure to Slack", exc_info=True)
-            return
-
-        # 6. Resolve the review thread on GitHub if we have a comment node ID
-        if comment_node_id:
-            try:
-                await self.git.resolve_review_thread(pr_url, comment_node_id)
-            except Exception:
-                logger.warning(
-                    "Failed to resolve review thread on GitHub",
-                    extra={"comment_node_id": comment_node_id},
-                    exc_info=True,
-                )
-
-        try:
-            await self.slack.post_message(
-                channel_id,
-                ":white_check_mark: I've pushed a fix for your comment to the PR.",
-                thread_ts=thread_ts,
-            )
-        except Exception:
-            logger.warning("Failed to post success to Slack", exc_info=True)
+                logger.warning("Failed to post success to Slack", exc_info=True)
 
     # ------------------------------------------------------------------
     # Pre-flight evaluator

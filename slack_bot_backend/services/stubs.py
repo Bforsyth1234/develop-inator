@@ -232,3 +232,9 @@ class StubGitService(GitService):
             },
         )
         return "stub-pr-url"
+
+    async def resolve_review_thread(self, pr_url: str, comment_node_id: str) -> None:
+        logger.info(
+            "Stub resolve_review_thread invoked",
+            extra={"pr_url": pr_url, "comment_node_id": comment_node_id},
+        )

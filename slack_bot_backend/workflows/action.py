@@ -216,6 +216,7 @@ class ActionWorkflow:
         pr_url: str,
         comment_body: str,
         sender: str,
+        comment_node_id: str | None = None,
     ) -> None:
         """Orchestrate a response to a GitHub PR comment.
 
@@ -325,6 +326,17 @@ class ActionWorkflow:
             except Exception:
                 logger.warning("Failed to post failure to Slack", exc_info=True)
             return
+
+        # 6. Resolve the review thread on GitHub if we have a comment node ID
+        if comment_node_id:
+            try:
+                await self.git.resolve_review_thread(pr_url, comment_node_id)
+            except Exception:
+                logger.warning(
+                    "Failed to resolve review thread on GitHub",
+                    extra={"comment_node_id": comment_node_id},
+                    exc_info=True,
+                )
 
         try:
             await self.slack.post_message(

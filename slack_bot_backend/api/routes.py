@@ -173,7 +173,11 @@ async def handle_github_webhook(
         return await _handle_review_comment(payload, container, background_tasks)
 
     if event_type == "pull_request_review":
-        return await _handle_pull_request_review(payload, container, background_tasks)
+        # Review-level events are typically summaries ("Review completed.
+        # 3 suggestions posted.") that duplicate the inline comments we
+        # already handle via pull_request_review_comment.  Skip them to
+        # avoid duplicate / non-actionable Aider runs.
+        return {"ok": True, "message": "pull_request_review events are handled via individual review comments"}
 
     if event_type != "push":
         return {"ok": True, "message": f"ignored event: {event_type}"}
@@ -267,6 +271,7 @@ async def _handle_review_comment(
 
     comment = payload.get("comment", {})
     comment_body: str = comment.get("body", "")
+    comment_node_id: str = comment.get("node_id", "")
     diff_hunk: str = comment.get("diff_hunk", "")
     path: str = comment.get("path", "")
 
@@ -291,6 +296,7 @@ async def _handle_review_comment(
         pr_url=pr_url,
         comment_body=enriched_body,
         sender=sender_login,
+        comment_node_id=comment_node_id or None,
     )
     return {"ok": True, "message": "pr review comment handler scheduled"}
 

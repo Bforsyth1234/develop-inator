@@ -46,12 +46,16 @@ class FakeGitService:
         self.pr_url = pr_url
         self.fail = fail
         self.pr_calls: list[PullRequestDraft] = []
+        self.resolved_threads: list[tuple[str, str]] = []
 
     async def create_pull_request(self, draft: PullRequestDraft) -> str:
         self.pr_calls.append(draft)
         if self.fail:
             raise RuntimeError("GitHub unavailable")
         return self.pr_url
+
+    async def resolve_review_thread(self, pr_url: str, comment_node_id: str) -> None:
+        self.resolved_threads.append((pr_url, comment_node_id))
 
 
 class FakeLanguageModel:

@@ -6,10 +6,14 @@ import base64
 from collections.abc import Sequence
 from urllib.parse import quote
 
+import logging
+
 import httpx
 
 from slack_bot_backend.models.action import ProposedFileChange, RepositorySearchResult
 from slack_bot_backend.services.interfaces import PullRequestDraft
+
+logger = logging.getLogger(__name__)
 
 
 class GitHubGitService:
@@ -180,3 +184,70 @@ class GitHubGitService:
         )
         response.raise_for_status()
         return response.json()["html_url"]
+
+    async def resolve_review_thread(self, pr_url: str, comment_node_id: str) -> None:
+        """Resolve a PR review thread via the GitHub GraphQL API.
+
+        Uses the comment's node_id to look up the corresponding review thread,
+        then calls the ``resolveReviewThread`` mutation.
+        """
+        # First, query for the review thread ID that contains this comment
+        query = """
+        query($nodeId: ID!) {
+          node(id: $nodeId) {
+            ... on PullRequestReviewComment {
+              pullRequestReviewThread {
+                id
+                isResolved
+              }
+            }
+          }
+        }
+        """
+        resp = await self._client.post(
+            "https://api.github.com/graphql",
+            json={"query": query, "variables": {"nodeId": comment_node_id}},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        node = (data.get("data") or {}).get("node") or {}
+        thread_info = node.get("pullRequestReviewThread")
+        if not thread_info:
+            logger.warning(
+                "Could not find review thread for comment node",
+                extra={"comment_node_id": comment_node_id, "response": data},
+            )
+            return
+
+        if thread_info.get("isResolved"):
+            logger.info("Review thread already resolved", extra={"comment_node_id": comment_node_id})
+            return
+
+        thread_id = thread_info["id"]
+
+        # Resolve the thread
+        mutation = """
+        mutation($threadId: ID!) {
+          resolveReviewThread(input: {threadId: $threadId}) {
+            thread { isResolved }
+          }
+        }
+        """
+        resp = await self._client.post(
+            "https://api.github.com/graphql",
+            json={"query": mutation, "variables": {"threadId": thread_id}},
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        errors = result.get("errors")
+        if errors:
+            logger.warning(
+                "GraphQL errors resolving review thread",
+                extra={"errors": errors, "thread_id": thread_id},
+            )
+        else:
+            logger.info(
+                "Resolved PR review thread",
+                extra={"thread_id": thread_id, "comment_node_id": comment_node_id},
+            )

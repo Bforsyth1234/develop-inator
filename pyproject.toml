@@ -9,9 +9,11 @@ description = "Foundational FastAPI scaffold for the Slack bot backend"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "celery>=5.6.2",
   "fastapi>=0.115,<1.0",
   "langgraph>=1.1.3",
   "python-dotenv>=1.0,<2.0",
+  "redis>=7.3.0",
   "tree-sitter>=0.25",
   "tree-sitter-javascript>=0.25",
   "tree-sitter-python>=0.25",

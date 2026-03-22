@@ -72,10 +72,15 @@ class Settings(BaseModel):
     cohere_api_key: str | None = Field(default=None, repr=False)
     cohere_rerank_model: str = "rerank-english-v3.0"
 
-    # Aider execution
-    repo_path: str = ""
-    aider_model_simple: str = "groq/llama-3.3-70b-versatile"
-    aider_model_complex: str = "anthropic/claude-sonnet-4-20250514"
+    # Celery / Redis
+    redis_url: str = "redis://localhost:6379/0"
+    celery_broker_url: str = "redis://localhost:6379/0"
+
+    # Aider execution — both tiers default to Claude Sonnet because weaker
+    # models (e.g. Groq/Llama) can't reliably produce valid code edits in
+    # any of Aider's edit formats (diff, whole, udiff).
+    aider_model_simple: str = "anthropic/claude-sonnet-4-20250514"
+    aider_model_complex: str = "anthropic/claude-opus-4-20250514"
 
     @model_validator(mode="after")
     def validate_provider_requirements(self) -> "Settings":
@@ -135,7 +140,8 @@ class Settings(BaseModel):
             "github_repository": source.get("SLACK_BOT_GITHUB_REPOSITORY"),
             "github_webhook_secret": source.get("SLACK_BOT_GITHUB_WEBHOOK_SECRET"),
             "github_bot_username": source.get("SLACK_BOT_GITHUB_BOT_USERNAME"),
-            "repo_path": source.get("SLACK_BOT_REPO_PATH"),
+            "redis_url": source.get("SLACK_BOT_REDIS_URL"),
+            "celery_broker_url": source.get("SLACK_BOT_CELERY_BROKER_URL"),
             "aider_model_simple": source.get("AIDER_MODEL_SIMPLE"),
             "aider_model_complex": source.get("AIDER_MODEL_COMPLEX"),
         }

@@ -182,8 +182,35 @@ class GitHubGitService:
                 "base": base_branch,
             },
         )
+        # 422 usually means a PR already exists for this head branch.
+        # Look it up and return the existing URL instead of crashing.
+        if response.status_code == 422:
+            existing_url = await self._find_existing_pr(repository, draft.branch_name)
+            if existing_url:
+                logger.info(
+                    "PR already exists for branch %s, returning existing URL",
+                    draft.branch_name,
+                )
+                return existing_url
+            # Not a duplicate-PR 422 — raise the original error.
+            response.raise_for_status()
         response.raise_for_status()
         return response.json()["html_url"]
+
+    async def _find_existing_pr(self, repository: str, head_branch: str) -> str | None:
+        """Find an open PR for *head_branch* and return its ``html_url``, or ``None``."""
+        owner = repository.split("/")[0] if "/" in repository else ""
+        head_param = f"{owner}:{head_branch}" if owner else head_branch
+        response = await self._client.get(
+            f"/repos/{repository}/pulls",
+            params={"head": head_param, "state": "open", "per_page": 1},
+        )
+        if response.status_code != 200:
+            return None
+        pulls = response.json()
+        if pulls:
+            return pulls[0].get("html_url")
+        return None
 
     async def resolve_review_thread(self, pr_url: str, comment_node_id: str) -> None:
         """Resolve a PR review thread via the GitHub GraphQL API.

@@ -40,7 +40,7 @@ class DependencyTests(unittest.TestCase):
                 slack=StubSlackGateway(),
                 llm=StubLanguageModel(),
                 git=StubGitService(),
-                repo_path="",
+                github_token="stub",
             ),
             intent=IntentWorkflow(
                 slack=StubSlackGateway(),
@@ -79,11 +79,9 @@ class DependencyTests(unittest.TestCase):
             supabase_enabled=True,
             supabase_url="https://example.supabase.co",
             supabase_service_role_key="service-role-key",
-            repo_path="/env/default/path",
             github_repository="env/default-repo",
         )
         stored_config = RepositoryConfig(
-            repo_path="/supabase/override/path",
             github_repository="supabase/override-repo",
         )
 
@@ -94,7 +92,6 @@ class DependencyTests(unittest.TestCase):
         ):
             container = build_service_container(settings)
 
-        self.assertEqual(container.action.repo_path, "/supabase/override/path")
         self.assertEqual(container.action.github_repository, "supabase/override-repo")
 
     def test_build_service_container_uses_env_defaults_when_supabase_returns_none(self) -> None:
@@ -103,7 +100,6 @@ class DependencyTests(unittest.TestCase):
             supabase_enabled=True,
             supabase_url="https://example.supabase.co",
             supabase_service_role_key="service-role-key",
-            repo_path="/env/path",
             github_repository="env/repo",
         )
 
@@ -114,7 +110,6 @@ class DependencyTests(unittest.TestCase):
         ):
             container = build_service_container(settings)
 
-        self.assertEqual(container.action.repo_path, "/env/path")
         self.assertEqual(container.action.github_repository, "env/repo")
 
     def test_build_service_container_uses_env_defaults_when_supabase_fetch_fails(self) -> None:
@@ -123,7 +118,6 @@ class DependencyTests(unittest.TestCase):
             supabase_enabled=True,
             supabase_url="https://example.supabase.co",
             supabase_service_role_key="service-role-key",
-            repo_path="/env/fallback",
             github_repository="env/fallback-repo",
         )
 
@@ -134,21 +128,18 @@ class DependencyTests(unittest.TestCase):
         ):
             container = build_service_container(settings)
 
-        self.assertEqual(container.action.repo_path, "/env/fallback")
         self.assertEqual(container.action.github_repository, "env/fallback-repo")
 
     def test_build_service_container_partial_override_from_supabase(self) -> None:
-        """Only repo_path is set in Supabase; github_repository falls back to env."""
+        """github_repository empty in Supabase → falls back to env."""
         settings = Settings(
             environment="testing",
             supabase_enabled=True,
             supabase_url="https://example.supabase.co",
             supabase_service_role_key="service-role-key",
-            repo_path="/env/path",
             github_repository="env/repo",
         )
         stored_config = RepositoryConfig(
-            repo_path="/supabase/path",
             github_repository="",  # empty → fall back to env
         )
 
@@ -159,7 +150,6 @@ class DependencyTests(unittest.TestCase):
         ):
             container = build_service_container(settings)
 
-        self.assertEqual(container.action.repo_path, "/supabase/path")
         self.assertEqual(container.action.github_repository, "env/repo")
 
 

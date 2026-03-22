@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import subprocess
+import tempfile
 from pathlib import Path
 
 import openai
@@ -217,22 +219,62 @@ async def _embed_batch(
 
 
 class CodebaseIndexer:
-    """Indexes a local repository into Supabase documentation_chunks for RAG."""
+    """Indexes a repository into Supabase documentation_chunks for RAG.
+
+    The indexer is **stateless**: it clones the target repository from GitHub
+    into an ephemeral temporary directory for every reindex run.
+    """
 
     def __init__(
         self,
         *,
         openai_api_key: str,
         transport: AsyncSupabaseTransport,
-        repo_path: str,
+        github_token: str = "",
+        github_repository: str = "",
     ) -> None:
         self._openai_api_key = openai_api_key
         self._repo = DocumentationChunkRepository(transport)
-        self._repo_path = repo_path
+        self._github_token = github_token
+        self._github_repository = github_repository
+
+    def _build_clone_url(self) -> str:
+        if not self._github_repository:
+            raise RuntimeError(
+                "github_repository is not set on CodebaseIndexer."
+            )
+        if not self._github_token:
+            raise RuntimeError(
+                "github_token is not set on CodebaseIndexer."
+            )
+        return (
+            f"https://x-access-token:{self._github_token}@github.com/"
+            f"{self._github_repository}.git"
+        )
 
     async def reindex(self) -> int:
-        """Incrementally index the repo. Returns total chunks upserted."""
-        repo_root = Path(self._repo_path).resolve()
+        """Clone from GitHub and incrementally index the repo. Returns total chunks upserted."""
+        clone_url = self._build_clone_url()
+
+        with tempfile.TemporaryDirectory(prefix="indexer-workspace-") as tmp_dir:
+            # Clone the repository (shallow for speed)
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                ["git", "clone", "--depth=1", clone_url, tmp_dir],
+                capture_output=True,
+                text=True,
+            )
+            if proc.returncode != 0:
+                # Never log the clone URL – it contains the token
+                safe_err = proc.stderr.replace(self._github_token, "***") if self._github_token else proc.stderr
+                logger.error("git clone failed: %s", safe_err)
+                return 0
+
+            return await self._index_directory(tmp_dir)
+
+    async def _index_directory(self, repo_path: str) -> int:
+        """Index all files in *repo_path*. Extracted so tests can bypass cloning."""
+        repo_root = Path(repo_path).resolve()
         if not repo_root.is_dir():
             logger.error("Repository path does not exist: %s", repo_root)
             return 0
@@ -320,7 +362,7 @@ class CodebaseIndexer:
                         path=rel_path,
                         content=text,
                         embedding=tuple(vector),
-                        metadata={"repo": repo_root.name, "file_checksum": file_hash},
+                        metadata={"repo": self._github_repository, "file_checksum": file_hash},
                         embedding_metadata=EmbeddingMetadata(
                             model=EMBEDDING_MODEL,
                             dimensions=len(vector),

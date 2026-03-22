@@ -9,9 +9,15 @@ import logging
 import time
 import urllib.parse
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import ValidationError
 
+from slack_bot_backend.celery_app import (
+    process_github_webhook_task,
+    process_pr_comment_task,
+    process_slack_mention_task,
+    process_spec_approval_task,
+)
 from slack_bot_backend.config import Settings
 from slack_bot_backend.dependencies import ServiceContainer, get_container
 from slack_bot_backend.models import ActionRequest, ActionRouteResult, QuestionRequest, QuestionRouteResult
@@ -85,7 +91,6 @@ async def handle_action(
 @router.post("/slack/events", tags=["slack"])
 async def handle_slack_events(
     request: Request,
-    background_tasks: BackgroundTasks,
     container: ServiceContainer = Depends(get_container),
 ) -> dict[str, object]:
     body = await request.body()
@@ -120,7 +125,7 @@ async def handle_slack_events(
     if envelope.event.type != "app_mention" or envelope.event.bot_id or envelope.event.subtype:
         return {"ok": True}
 
-    background_tasks.add_task(container.intent.process_app_mention, envelope)
+    process_slack_mention_task.delay(body.decode("utf-8"))
     return {"ok": True}
 
 
@@ -141,7 +146,6 @@ def _verify_github_signature(secret: str, body: bytes, signature_header: str | N
 @router.post("/github/webhook", tags=["github"])
 async def handle_github_webhook(
     request: Request,
-    background_tasks: BackgroundTasks,
     container: ServiceContainer = Depends(get_container),
 ) -> dict[str, object]:
     body = await request.body()
@@ -167,10 +171,10 @@ async def handle_github_webhook(
 
     # ── Handle PR comment events ──
     if event_type == "issue_comment":
-        return await _handle_issue_comment(payload, container, background_tasks)
+        return await _handle_issue_comment(payload, container)
 
     if event_type == "pull_request_review_comment":
-        return await _handle_review_comment(payload, container, background_tasks)
+        return await _handle_review_comment(payload, container)
 
     if event_type == "pull_request_review":
         # Review-level events are typically summaries ("Review completed.
@@ -201,7 +205,7 @@ async def handle_github_webhook(
         "GitHub push to default branch detected — scheduling re-index",
         extra={"ref": ref, "default_branch": default_branch},
     )
-    background_tasks.add_task(container.indexer.reindex)
+    process_github_webhook_task.delay()
     return {"ok": True, "message": "re-index scheduled"}
 
 
@@ -213,7 +217,6 @@ async def handle_github_webhook(
 async def _handle_issue_comment(
     payload: dict,
     container: ServiceContainer,
-    background_tasks: BackgroundTasks,
 ) -> dict[str, object]:
     """Dispatch a GitHub ``issue_comment`` event if it's on a PR we created."""
     # Only handle newly created comments
@@ -242,11 +245,12 @@ async def _handle_issue_comment(
         extra={"pr_url": pr_url, "sender": sender_login},
     )
 
-    background_tasks.add_task(
-        container.action.handle_pr_comment,
-        pr_url=pr_url,
-        comment_body=comment_body,
-        sender=sender_login,
+    process_pr_comment_task.apply_async(
+        kwargs={
+            "pr_url": pr_url,
+            "comment_body": comment_body,
+            "sender": sender_login,
+        },
     )
     return {"ok": True, "message": "pr comment handler scheduled"}
 
@@ -259,7 +263,6 @@ async def _handle_issue_comment(
 async def _handle_review_comment(
     payload: dict,
     container: ServiceContainer,
-    background_tasks: BackgroundTasks,
 ) -> dict[str, object]:
     """Dispatch a GitHub ``pull_request_review_comment`` event (inline code comment)."""
     if payload.get("action") != "created":
@@ -291,12 +294,13 @@ async def _handle_review_comment(
         extra={"pr_url": pr_url, "sender": sender_login, "path": path},
     )
 
-    background_tasks.add_task(
-        container.action.handle_pr_comment,
-        pr_url=pr_url,
-        comment_body=enriched_body,
-        sender=sender_login,
-        comment_node_id=comment_node_id or None,
+    process_pr_comment_task.apply_async(
+        kwargs={
+            "pr_url": pr_url,
+            "comment_body": enriched_body,
+            "sender": sender_login,
+            "comment_node_id": comment_node_id or None,
+        },
     )
     return {"ok": True, "message": "pr review comment handler scheduled"}
 
@@ -309,7 +313,6 @@ async def _handle_review_comment(
 async def _handle_spec_action(
     container: ServiceContainer,
     payload: dict,
-    background_tasks: BackgroundTasks,
 ) -> dict[str, object]:
     """Process approve_spec / reject_spec button clicks."""
     actions = payload.get("actions", [])
@@ -344,57 +347,10 @@ async def _handle_spec_action(
             except Exception:
                 logger.warning("Could not update approval message", exc_info=True)
 
-        # Kick off Aider in the background with the approved spec as the prompt.
-        # If this thread is associated with an existing PR branch (e.g. from
-        # a PR comment feedback loop), push to that branch instead of creating
-        # a new one.
-        async def _execute_approved() -> None:
-            from slack_bot_backend.models.action import ActionRequest as _AR
-            req = _AR(
-                channel=execution.channel,
-                thread_ts=execution.thread_ts,
-                request=execution.original_request,
-                user_id=execution.user_id,
-            )
-            # Check for an existing PR branch linked to this thread
-            existing_branch: str | None = None
-            try:
-                mapping = await container.supabase.get_pr_mapping_by_thread(
-                    channel_id=execution.channel,
-                    thread_ts=execution.thread_ts,
-                )
-                if mapping is not None:
-                    existing_branch = mapping.branch_name
-            except Exception:
-                logger.warning("Could not look up PR mapping for thread", exc_info=True)
-
-            selected_model = execution.model or container.action.model_tier_map.get("complex", "")
-            try:
-                aider_result = await container.action._run_aider(
-                    req,
-                    optimized_prompt=execution.generated_spec,
-                    model=selected_model,
-                    existing_branch=existing_branch,
-                )
-                if aider_result.returncode != 0:
-                    if aider_result.test_attempts > 0:
-                        await container.action._handle_test_failure(req, aider_result)
-                    else:
-                        await container.action._handle_failure(req, aider_result)
-                else:
-                    await container.action._handle_success(req, aider_result, model=selected_model)
-            except Exception:
-                logger.exception("Approved spec execution failed")
-                try:
-                    await container.slack.post_message(
-                        execution.channel,
-                        ":x: I hit an error executing the approved spec. Please check the logs.",
-                        thread_ts=execution.thread_ts,
-                    )
-                except Exception:
-                    logger.warning("Failed to post error to Slack", exc_info=True)
-
-        background_tasks.add_task(_execute_approved)
+        # Kick off Aider execution via Celery task
+        process_spec_approval_task.apply_async(
+            kwargs={"execution_id": execution_id},
+        )
         return {"ok": True}
 
     if action_id == "reject_spec":
@@ -418,7 +374,6 @@ async def _handle_spec_action(
 @router.post("/slack/interactions", tags=["slack"])
 async def handle_slack_interactions(
     request: Request,
-    background_tasks: BackgroundTasks,
     container: ServiceContainer = Depends(get_container),
 ) -> dict[str, object]:
     """Handle Slack interactive component payloads (Block Kit buttons, etc.)."""
@@ -439,6 +394,6 @@ async def handle_slack_interactions(
 
     interaction_type = payload.get("type", "")
     if interaction_type == "block_actions":
-        return await _handle_spec_action(container, payload, background_tasks)
+        return await _handle_spec_action(container, payload)
 
     return {"ok": True}

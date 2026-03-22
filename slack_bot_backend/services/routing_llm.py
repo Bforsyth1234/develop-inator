@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 _ROUTER_PROMPT = (
     "You are a request complexity classifier. Classify the following request into "
     "exactly one complexity tier. Return JSON only with this exact schema:\n"
-    '{"tier": "light|standard|heavy", "reason": "one sentence explanation"}\n\n'
+    '{{"tier": "light|standard|heavy", "reason": "one sentence explanation"}}\n\n'
     "Tier definitions:\n"
     "- light: Simple factual lookups, short classifications, reformatting, "
     "intent detection, yes/no questions, or very short responses.\n"

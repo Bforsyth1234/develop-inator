@@ -72,7 +72,7 @@ class SupabaseRepository(Protocol):
     async def get_repository_config(self) -> RepositoryConfig | None: ...
 
     async def save_repository_config(
-        self, *, repo_path: str, github_repository: str
+        self, *, github_repository: str
     ) -> None: ...
 
     # -- Action execution persistence (planner / approval flow) --

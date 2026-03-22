@@ -348,7 +348,6 @@ class RepositoryConfigRepositoryTests(unittest.IsolatedAsyncioTestCase):
                     status_code=200,
                     data=[
                         {
-                            "repo_path": "/home/user/my-repo",
                             "github_repository": "owner/my-repo",
                             "updated_at": "2026-03-21T10:00:00",
                         }
@@ -361,7 +360,6 @@ class RepositoryConfigRepositoryTests(unittest.IsolatedAsyncioTestCase):
         config = await repository.get_config()
 
         self.assertIsNotNone(config)
-        self.assertEqual(config.repo_path, "/home/user/my-repo")
         self.assertEqual(config.github_repository, "owner/my-repo")
         self.assertEqual(config.updated_at, "2026-03-21T10:00:00")
         call = transport.calls[0]
@@ -403,7 +401,6 @@ class RepositoryConfigRepositoryTests(unittest.IsolatedAsyncioTestCase):
         repository = RepositoryConfigRepository(transport)
 
         await repository.save_config(
-            repo_path="/tmp/new-repo",
             github_repository="org/new-repo",
         )
 
@@ -412,7 +409,6 @@ class RepositoryConfigRepositoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call["path"], "rest/v1/repository_config")
         self.assertEqual(call["headers"]["Prefer"], "resolution=merge-duplicates,return=minimal")
         self.assertEqual(call["json_body"]["config_key"], "default")
-        self.assertEqual(call["json_body"]["repo_path"], "/tmp/new-repo")
         self.assertEqual(call["json_body"]["github_repository"], "org/new-repo")
         self.assertIn("updated_at", call["json_body"])
 
@@ -431,7 +427,6 @@ class RepositoryConfigRepositoryTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(SupabasePersistenceError) as context:
             await repository.save_config(
-                repo_path="/tmp/repo",
                 github_repository="org/repo",
             )
 
@@ -467,7 +462,6 @@ class SupabasePersistenceRepositoryTests(unittest.IsolatedAsyncioTestCase):
                     status_code=200,
                     data=[
                         {
-                            "repo_path": "/srv/app",
                             "github_repository": "team/app",
                             "updated_at": "2026-03-21T12:00:00",
                         }
@@ -480,7 +474,6 @@ class SupabasePersistenceRepositoryTests(unittest.IsolatedAsyncioTestCase):
         config = await repository.get_repository_config()
 
         self.assertIsNotNone(config)
-        self.assertEqual(config.repo_path, "/srv/app")
         self.assertEqual(config.github_repository, "team/app")
 
     async def test_save_repository_config_delegates_to_config_repository(self):
@@ -490,14 +483,13 @@ class SupabasePersistenceRepositoryTests(unittest.IsolatedAsyncioTestCase):
         repository = SupabasePersistenceRepository(transport)
 
         await repository.save_repository_config(
-            repo_path="/srv/app",
             github_repository="team/app",
         )
 
         call = transport.calls[0]
         self.assertEqual(call["method"], "POST")
         self.assertEqual(call["path"], "rest/v1/repository_config")
-        self.assertEqual(call["json_body"]["repo_path"], "/srv/app")
+        self.assertEqual(call["json_body"]["github_repository"], "team/app")
 
 
 def _make_match(content: str, similarity: float = 0.9, index: int = 0) -> DocumentationMatch:

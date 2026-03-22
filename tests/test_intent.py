@@ -3,6 +3,7 @@ import hmac
 import json
 import time
 import unittest
+from unittest import mock
 
 from fastapi.testclient import TestClient
 
@@ -72,8 +73,8 @@ class FakeSupabaseRepository:
     async def get_repository_config(self):
         return None
 
-    async def save_repository_config(self, *, repo_path: str, github_repository: str) -> None:
-        self.saved_configs.append({"repo_path": repo_path, "github_repository": github_repository})
+    async def save_repository_config(self, *, github_repository: str) -> None:
+        self.saved_configs.append({"github_repository": github_repository})
 
     async def save_action_execution(self, execution: ActionExecution) -> None:
         pass
@@ -98,7 +99,7 @@ class FakeLanguageModel:
         *,
         classify_answer: str = '{"intent":"QUESTION","rationale":"The user is asking for guidance."}',
         question_answer: str = "Grounded answer.",
-        configure_answer: str = '{"repo_path": null, "github_repository": null}',
+        configure_answer: str = '{"github_repository": null}',
     ) -> None:
         self.classify_answer = classify_answer
         self.question_answer = question_answer
@@ -263,11 +264,11 @@ class IntentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         supabase = FakeSupabaseRepository()
         llm = FakeLanguageModel(
             classify_answer='{"intent":"CONFIGURE","rationale":"The user wants to change the repo."}',
-            configure_answer='{"repo_path": "/new/path", "github_repository": "org/new-repo"}',
+            configure_answer='{"github_repository": "org/new-repo"}',
         )
         configure = ConfigureWorkflow(
             slack=slack, supabase=supabase, llm=llm,
-            repo_path="/old/path", github_repository="org/old-repo",
+            github_repository="org/old-repo",
         )
         workflow = IntentWorkflow(
             slack=slack, supabase=supabase, llm=llm, configure=configure,
@@ -289,7 +290,6 @@ class IntentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(classification)
         self.assertEqual(str(classification.intent), "CONFIGURE")
         self.assertEqual(len(supabase.saved_configs), 1)
-        self.assertEqual(supabase.saved_configs[0]["repo_path"], "/new/path")
         self.assertEqual(supabase.saved_configs[0]["github_repository"], "org/new-repo")
         self.assertEqual(len(slack.messages), 1)
         self.assertIn("updated", slack.messages[0]["text"])
@@ -326,11 +326,11 @@ class IntentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         supabase = FakeSupabaseRepository()
         llm = FakeLanguageModel(
             classify_answer='{"intent":"CONFIGURE","rationale":"User wants to change repo."}',
-            configure_answer='{"repo_path": null, "github_repository": "org/only-this"}',
+            configure_answer='{"github_repository": "org/only-this"}',
         )
         configure = ConfigureWorkflow(
             slack=slack, supabase=supabase, llm=llm,
-            repo_path="/existing/path", github_repository="org/old",
+            github_repository="org/old",
         )
         workflow = IntentWorkflow(
             slack=slack, supabase=supabase, llm=llm, configure=configure,
@@ -350,7 +350,6 @@ class IntentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(len(supabase.saved_configs), 1)
-        self.assertEqual(supabase.saved_configs[0]["repo_path"], "/existing/path")
         self.assertEqual(supabase.saved_configs[0]["github_repository"], "org/only-this")
 
     async def test_classify_rejects_non_json_output(self) -> None:
@@ -438,18 +437,19 @@ class SlackEventsEndpointTests(unittest.TestCase):
         }
         body = json.dumps(payload).encode("utf-8")
 
-        with TestClient(app) as client:
-            response = client.post(
-                "/api/slack/events",
-                content=body,
-                headers=_signed_headers(body, "signing-secret"),
-            )
+        with mock.patch(
+            "slack_bot_backend.api.routes.process_slack_mention_task"
+        ) as mock_task:
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/slack/events",
+                    content=body,
+                    headers=_signed_headers(body, "signing-secret"),
+                )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"ok": True})
-        self.assertEqual(container.slack.messages, [])
-        self.assertEqual(len(container.action.requests), 1)
-        self.assertEqual(container.action.requests[0]["thread_ts"], "1710.1")
+        mock_task.delay.assert_called_once()
 
     def test_retry_request_is_acknowledged_without_processing(self) -> None:
         container = self._build_container()

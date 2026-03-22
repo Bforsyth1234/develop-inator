@@ -94,11 +94,11 @@ class StubSupabaseRepository(SupabaseRepository):
         return None
 
     async def save_repository_config(
-        self, *, repo_path: str, github_repository: str
+        self, *, github_repository: str
     ) -> None:
         logger.info(
             "Stub Supabase save_repository_config invoked",
-            extra={"repo_path": repo_path, "github_repository": github_repository},
+            extra={"github_repository": github_repository},
         )
 
     async def save_action_execution(self, execution: ActionExecution) -> None:
@@ -180,7 +180,7 @@ class StubLanguageModel(LanguageModel):
             )
         if "configuration assistant" in prompt.lower():
             return LLMResult(
-                content=json.dumps({"repo_path": None, "github_repository": None}),
+                content=json.dumps({"github_repository": None}),
                 provider="stub",
             )
         return LLMResult(content="stub-response", provider="stub")

@@ -8,6 +8,7 @@ import logging
 import os
 import subprocess
 import sys
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,8 +31,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _MODEL_TIER_MAP: dict[str, str] = {
-    "simple": "groq/llama-3.3-70b-versatile",
-    "complex": "anthropic/claude-sonnet-4-20250514",
+    "simple": "anthropic/claude-sonnet-4-20250514",
+    "complex": "anthropic/claude-opus-4-20250514",
 }
 
 # ---------------------------------------------------------------------------
@@ -148,7 +149,7 @@ class ActionWorkflow:
         slack: SlackGateway,
         git: ActionGitOperations,
         llm: LanguageModel,
-        repo_path: str,
+        github_token: str = "",
         github_repository: str = "",
         supabase: SupabaseRepository | None = None,
         model_tier_map: dict[str, str] | None = None,
@@ -157,7 +158,7 @@ class ActionWorkflow:
         self.slack = slack
         self.git = git
         self.llm = llm
-        self.repo_path = repo_path
+        self.github_token = github_token
         self.github_repository = github_repository
         self.supabase = supabase
         self.model_tier_map: dict[str, str] = dict(model_tier_map or _MODEL_TIER_MAP)
@@ -576,22 +577,30 @@ class ActionWorkflow:
         llm_key = os.environ.get("SLACK_BOT_LLM_API_KEY")
         if llm_key and not env.get("ANTHROPIC_API_KEY"):
             env["ANTHROPIC_API_KEY"] = llm_key
+        # Map SLACK_BOT_GROQ_API_KEY → GROQ_API_KEY for Aider/litellm.
+        groq_key = os.environ.get("SLACK_BOT_GROQ_API_KEY")
+        if groq_key and not env.get("GROQ_API_KEY"):
+            env["GROQ_API_KEY"] = groq_key
+        # Suppress noisy HuggingFace Hub warnings in Aider output.
+        env.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+        env.setdefault("TOKENIZERS_PARALLELISM", "false")
         return env
 
     _GIT_TIMEOUT = 120  # seconds
     _AIDER_TIMEOUT = 600  # 10 minutes
     _TEST_TIMEOUT = 300  # 5 minutes
 
-    async def _git(self, *args: str) -> subprocess.CompletedProcess[str]:
-        """Run a git command in the target repo."""
-        logger.debug("Running git %s", " ".join(args))
+    async def _git(self, *args: str, cwd: str | None = None) -> subprocess.CompletedProcess[str]:
+        """Run a git command in an explicit *cwd* (required for stateless mode)."""
+        work_dir = cwd or os.getcwd()
+        logger.debug("Running git %s (cwd=%s)", " ".join(args), work_dir)
         try:
             result = await asyncio.to_thread(
                 subprocess.run,
                 ["git", *args],
                 capture_output=True,
                 text=True,
-                cwd=self.repo_path,
+                cwd=work_dir,
                 timeout=self._GIT_TIMEOUT,
             )
         except subprocess.TimeoutExpired:
@@ -611,9 +620,9 @@ class ActionWorkflow:
 
     _MAX_TEST_ATTEMPTS = 3
 
-    def _detect_test_command(self) -> list[str] | None:
+    def _detect_test_command(self, work_dir: str | None = None) -> list[str] | None:
         """Detect the test command for the repository. Returns None if unknown."""
-        repo = Path(self.repo_path)
+        repo = Path(work_dir or os.getcwd())
         # Node / npm projects
         if (repo / "package.json").exists():
             return ["npm", "test"]
@@ -633,16 +642,17 @@ class ActionWorkflow:
         return None
 
     async def _run_test_command(
-        self, test_cmd: list[str], env: dict[str, str],
+        self, test_cmd: list[str], env: dict[str, str], *, cwd: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Run the test suite and return the completed process."""
+        work_dir = cwd or os.getcwd()
         try:
             return await asyncio.to_thread(
                 subprocess.run,
                 test_cmd,
                 capture_output=True,
                 text=True,
-                cwd=self.repo_path,
+                cwd=work_dir,
                 env=env,
                 timeout=self._TEST_TIMEOUT,
             )
@@ -655,6 +665,19 @@ class ActionWorkflow:
                 stderr=f"[bot] Test command timed out after {self._TEST_TIMEOUT}s",
             )
 
+    def _build_clone_url(self) -> str:
+        """Build a GitHub clone URL using the ``x-access-token`` scheme."""
+        if not self.github_repository:
+            raise RuntimeError(
+                "github_repository is not set. Configure it via /configure or the "
+                "SLACK_BOT_GITHUB_REPOSITORY environment variable."
+            )
+        if not self.github_token:
+            raise RuntimeError(
+                "github_token is not set. Set SLACK_BOT_GITHUB_TOKEN."
+            )
+        return f"https://x-access-token:{self.github_token}@github.com/{self.github_repository}.git"
+
     async def _run_aider(
         self,
         request: ActionRequest,
@@ -663,56 +686,87 @@ class ActionWorkflow:
         model: str,
         existing_branch: str | None = None,
     ) -> AiderResult:
-        if not self.repo_path:
-            raise RuntimeError(
-                "repo_path is empty. Set SLACK_BOT_REPO_PATH to an existing local clone."
-            )
+        clone_url = self._build_clone_url()
         subprocess_env = self._build_subprocess_env()
 
-        # 0. Record the current branch so we can return to it on failure,
-        #    stash any dirty working-tree changes.
-        head_ref = await self._git("rev-parse", "--abbrev-ref", "HEAD")
-        base_branch = head_ref.stdout.strip() or "main"
+        # ── Workspace isolation: every Aider run happens in an ephemeral
+        #    temporary clone so concurrent runs never collide on git state.
+        with tempfile.TemporaryDirectory(prefix="aider-workspace-") as tmp_dir:
+            return await self._run_aider_in_workspace(
+                request,
+                work_dir=tmp_dir,
+                clone_url=clone_url,
+                subprocess_env=subprocess_env,
+                optimized_prompt=optimized_prompt,
+                model=model,
+                existing_branch=existing_branch,
+            )
 
-        stash_result = await self._git("stash", "--include-untracked")
-        did_stash = "No local changes" not in (stash_result.stdout or "")
+    async def _run_aider_in_workspace(
+        self,
+        request: ActionRequest,
+        *,
+        work_dir: str,
+        clone_url: str,
+        subprocess_env: dict[str, str],
+        optimized_prompt: str,
+        model: str,
+        existing_branch: str | None = None,
+    ) -> AiderResult:
+        """Execute Aider inside an isolated *work_dir* clone."""
+
+        # 0. Clone the repo from GitHub into the ephemeral workspace.
+        #    NOTE: clone_url contains a token – never log it.
+        clone_proc = await self._git(
+            "clone", "--no-checkout", clone_url, work_dir,
+        )
+        if clone_proc.returncode != 0:
+            # Sanitise stderr/stdout so tokens are never leaked.
+            safe_stderr = self._sanitise_output(clone_proc.stderr)
+            safe_stdout = self._sanitise_output(clone_proc.stdout)
+            return AiderResult(
+                branch_name="",
+                stdout=safe_stdout,
+                stderr=safe_stderr,
+                returncode=clone_proc.returncode,
+            )
+
+        # Configure git identity in the ephemeral clone so Aider can commit.
+        await self._git("config", "user.name", "develop-inator[bot]", cwd=work_dir)
+        await self._git("config", "user.email", "develop-inator[bot]@users.noreply.github.com", cwd=work_dir)
+
+        # Fetch latest state inside the clone.
+        await self._git("fetch", "origin", cwd=work_dir)
 
         if existing_branch is not None:
             # ── Existing branch: fetch, checkout, and pull ──
             branch_name = existing_branch
-            await self._git("fetch", "origin", existing_branch)
-            checkout_proc = await self._git("checkout", existing_branch)
+            await self._git("fetch", "origin", existing_branch, cwd=work_dir)
+            checkout_proc = await self._git("checkout", existing_branch, cwd=work_dir)
             if checkout_proc.returncode != 0:
-                if did_stash:
-                    await self._git("stash", "pop")
                 return AiderResult(
                     branch_name=branch_name,
                     stdout=checkout_proc.stdout,
                     stderr=checkout_proc.stderr,
                     returncode=checkout_proc.returncode,
                 )
-            await self._git("pull", "origin", existing_branch)
-            # Record the current HEAD so we can detect new commits
-            base_sha_proc = await self._git("rev-parse", "HEAD")
+            await self._git("pull", "origin", existing_branch, cwd=work_dir)
+            base_sha_proc = await self._git("rev-parse", "HEAD", cwd=work_dir)
             base_sha = base_sha_proc.stdout.strip()
         else:
             # ── New branch: create from origin/main ──
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
             branch_name = f"ai-update-{timestamp}"
 
-            # Fetch latest remote state so the branch starts clean.
-            await self._git("fetch", "origin", "main")
+            await self._git("fetch", "origin", "main", cwd=work_dir)
 
-            # Record the commit SHA we'll branch from (remote main, not local).
-            base_sha_proc = await self._git("rev-parse", "origin/main")
+            base_sha_proc = await self._git("rev-parse", "origin/main", cwd=work_dir)
             base_sha = base_sha_proc.stdout.strip()
 
-            # 1. Create a new branch from origin/main (ignoring local-only commits)
-            checkout_proc = await self._git("checkout", "-b", branch_name, "origin/main")
+            checkout_proc = await self._git(
+                "checkout", "-b", branch_name, "origin/main", cwd=work_dir,
+            )
             if checkout_proc.returncode != 0:
-                # Restore stash before returning
-                if did_stash:
-                    await self._git("stash", "pop")
                 return AiderResult(
                     branch_name=branch_name,
                     stdout=checkout_proc.stdout,
@@ -736,7 +790,7 @@ class ActionWorkflow:
         logger.info(
             "Launching Aider subprocess",
             extra={
-                "cwd": self.repo_path,
+                "cwd": work_dir,
                 "branch": branch_name,
                 "model": model,
                 "channel": request.channel,
@@ -748,7 +802,7 @@ class ActionWorkflow:
                 aider_cmd,
                 capture_output=True,
                 text=True,
-                cwd=self.repo_path,
+                cwd=work_dir,
                 env=subprocess_env,
                 timeout=self._AIDER_TIMEOUT,
             )
@@ -762,10 +816,13 @@ class ActionWorkflow:
             )
 
         # 2b. Check if Aider failed or made no changes.
-        # Compare current HEAD against the base SHA to see if any new commits
-        # were added — this catches Aider auth errors that exit 0 and also
-        # prevents pushing dirty working-tree changes that were already present.
-        current_sha_proc = await self._git("rev-parse", "HEAD")
+        logger.info(
+            "Aider subprocess finished (exit %d)\nstdout: %s\nstderr: %s",
+            aider_proc.returncode,
+            self._sanitise_output(aider_proc.stdout[-3000:]) if aider_proc.stdout else "(empty)",
+            self._sanitise_output(aider_proc.stderr[-3000:]) if aider_proc.stderr else "(empty)",
+        )
+        current_sha_proc = await self._git("rev-parse", "HEAD", cwd=work_dir)
         current_sha = current_sha_proc.stdout.strip()
         aider_made_commits = current_sha != base_sha
 
@@ -776,16 +833,10 @@ class ActionWorkflow:
                 else "no commits produced"
             )
             logger.warning(
-                "Aider run unsuccessful (%s); cleaning up branch",
+                "Aider run unsuccessful (%s); ephemeral workspace will be cleaned up",
                 reason,
                 extra={"branch": branch_name, "channel": request.channel},
             )
-            # Clean up: switch back to base branch, delete the AI branch,
-            # and restore stashed changes.
-            await self._git("checkout", base_branch)
-            await self._git("branch", "-D", branch_name)
-            if did_stash:
-                await self._git("stash", "pop")
             return AiderResult(
                 branch_name=branch_name,
                 stdout=aider_proc.stdout,
@@ -796,7 +847,7 @@ class ActionWorkflow:
             )
 
         # 3. Run test validation loop (if a test framework is detected)
-        test_cmd = self._detect_test_command()
+        test_cmd = self._detect_test_command(work_dir)
         test_attempts = 0
         last_test_output = ""
         if test_cmd is not None:
@@ -808,7 +859,9 @@ class ActionWorkflow:
                     self._MAX_TEST_ATTEMPTS,
                     extra={"branch": branch_name, "channel": request.channel},
                 )
-                test_proc = await self._run_test_command(test_cmd, subprocess_env)
+                test_proc = await self._run_test_command(
+                    test_cmd, subprocess_env, cwd=work_dir,
+                )
                 last_test_output = (
                     (test_proc.stderr or "")
                     + "\n"
@@ -848,7 +901,7 @@ class ActionWorkflow:
                             retry_cmd,
                             capture_output=True,
                             text=True,
-                            cwd=self.repo_path,
+                            cwd=work_dir,
                             env=subprocess_env,
                             timeout=self._AIDER_TIMEOUT,
                         )
@@ -861,10 +914,6 @@ class ActionWorkflow:
                     self._MAX_TEST_ATTEMPTS,
                     extra={"branch": branch_name, "channel": request.channel},
                 )
-                await self._git("checkout", base_branch)
-                await self._git("branch", "-D", branch_name)
-                if did_stash:
-                    await self._git("stash", "pop")
                 return AiderResult(
                     branch_name=branch_name,
                     stdout=aider_proc.stdout,
@@ -877,20 +926,19 @@ class ActionWorkflow:
                     test_output=last_test_output,
                 )
 
-        # 4. Push the branch to origin
+        # 4. Push the branch to origin (from the ephemeral clone)
         logger.info(
             "Pushing branch to origin",
             extra={"branch": branch_name, "channel": request.channel},
         )
-        push_proc = await self._git("push", "--force-with-lease", "origin", branch_name)
+        push_proc = await self._git(
+            "push", "--force-with-lease", "origin", branch_name, cwd=work_dir,
+        )
         logger.info(
             "Push completed",
             extra={"branch": branch_name, "returncode": push_proc.returncode},
         )
         if push_proc.returncode != 0:
-            await self._git("checkout", base_branch)
-            if did_stash:
-                await self._git("stash", "pop")
             return AiderResult(
                 branch_name=branch_name,
                 stdout=push_proc.stdout,
@@ -898,11 +946,7 @@ class ActionWorkflow:
                 returncode=push_proc.returncode,
             )
 
-        # 5. Return to base branch and restore stash
-        await self._git("checkout", base_branch)
-        if did_stash:
-            await self._git("stash", "pop")
-
+        # 5. Temp directory will be cleaned up automatically on exit.
         return AiderResult(
             branch_name=branch_name,
             stdout=aider_proc.stdout,
@@ -1039,13 +1083,18 @@ class ActionWorkflow:
                 exc_info=True,
             )
 
+    def _sanitise_output(self, text: str) -> str:
+        """Strip the GitHub token from any subprocess output to prevent leaks."""
+        if self.github_token and self.github_token in text:
+            return text.replace(self.github_token, "***")
+        return text
+
     async def _save_repository_config(self) -> None:
-        """Persist the current repo_path and github_repository to Supabase."""
+        """Persist the current github_repository to Supabase."""
         if self.supabase is None:
             return
         try:
             await self.supabase.save_repository_config(
-                repo_path=self.repo_path,
                 github_repository=self.github_repository,
             )
         except Exception:

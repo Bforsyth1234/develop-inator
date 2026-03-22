@@ -44,7 +44,6 @@ def build_service_container(settings: Settings) -> ServiceContainer:
     llm = _build_language_model(settings)
 
     # Load dynamic repo config from Supabase, falling back to env values
-    repo_path = settings.repo_path
     github_repository = settings.github_repository or ""
     if isinstance(supabase, SupabasePersistenceRepository):
         try:
@@ -63,9 +62,6 @@ def build_service_container(settings: Settings) -> ServiceContainer:
             else:
                 config = asyncio.run(supabase.get_repository_config())
             if config is not None:
-                if config.repo_path:
-                    repo_path = config.repo_path
-                    logger.info("Loaded repo_path from Supabase: %s", repo_path)
                 if config.github_repository:
                     github_repository = config.github_repository
                     logger.info(
@@ -84,7 +80,7 @@ def build_service_container(settings: Settings) -> ServiceContainer:
         git=git,
         llm=llm,
         supabase=supabase,
-        repo_path=repo_path,
+        github_token=settings.github_token or "",
         github_repository=github_repository,
         settings=settings,
     )
@@ -98,10 +94,9 @@ def build_service_container(settings: Settings) -> ServiceContainer:
         slack=slack,
         supabase=supabase,
         llm=llm,
-        repo_path=repo_path,
         github_repository=github_repository,
     )
-    indexer = _build_indexer(settings, repo_path=repo_path)
+    indexer = _build_indexer(settings)
     return ServiceContainer(
         settings=settings,
         slack=slack,
@@ -266,7 +261,7 @@ def _build_action_workflow(
     git: GitService,
     llm: LanguageModel,
     supabase: SupabaseRepository,
-    repo_path: str,
+    github_token: str,
     github_repository: str,
     settings: Settings,
 ) -> ActionWorkflow:
@@ -276,7 +271,7 @@ def _build_action_workflow(
         slack=slack,
         git=git,
         llm=llm,
-        repo_path=repo_path,
+        github_token=github_token,
         github_repository=github_repository,
         supabase=supabase,
         model_tier_map={
@@ -287,15 +282,15 @@ def _build_action_workflow(
 
 
 def _build_indexer(
-    settings: Settings, *, repo_path: str = ""
+    settings: Settings,
 ) -> CodebaseIndexer | None:
-    resolved_repo_path = repo_path or settings.repo_path
     if (
         not settings.supabase_enabled
         or not settings.supabase_url
         or not settings.supabase_service_role_key
         or not settings.openai_api_key
-        or not resolved_repo_path
+        or not settings.github_token
+        or not settings.github_repository
     ):
         return None
     transport = UrllibSupabaseTransport(
@@ -305,7 +300,8 @@ def _build_indexer(
     return CodebaseIndexer(
         openai_api_key=settings.openai_api_key,
         transport=transport,
-        repo_path=resolved_repo_path,
+        github_token=settings.github_token,
+        github_repository=settings.github_repository,
     )
 
 

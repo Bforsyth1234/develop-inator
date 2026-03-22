@@ -411,7 +411,6 @@ class DocumentationChunkRepository:
 class RepositoryConfig:
     """Persisted repository configuration values."""
 
-    repo_path: str
     github_repository: str
     updated_at: str | None = None
 
@@ -431,7 +430,7 @@ class RepositoryConfigRepository:
                 "GET",
                 "rest/v1/repository_config",
                 query={
-                    "select": "repo_path,github_repository,updated_at",
+                    "select": "github_repository,updated_at",
                     "config_key": f"eq.{self._CONFIG_KEY}",
                     "limit": "1",
                 },
@@ -448,18 +447,16 @@ class RepositoryConfigRepository:
             return None
         row = _expect_mapping(rows[0], "repository_config row")
         return RepositoryConfig(
-            repo_path=str(row.get("repo_path", "")),
             github_repository=str(row.get("github_repository", "")),
             updated_at=_string_or_none(row.get("updated_at")),
         )
 
     async def save_config(
-        self, *, repo_path: str, github_repository: str
+        self, *, github_repository: str
     ) -> None:
         """Upsert the singleton repository config row."""
         payload: dict[str, JSONValue] = {
             "config_key": self._CONFIG_KEY,
-            "repo_path": repo_path,
             "github_repository": github_repository,
             "updated_at": datetime.now().isoformat(),
         }
@@ -700,10 +697,10 @@ class SupabasePersistenceRepository:
         return await self._repo_config.get_config()
 
     async def save_repository_config(
-        self, *, repo_path: str, github_repository: str
+        self, *, github_repository: str
     ) -> None:
         await self._repo_config.save_config(
-            repo_path=repo_path, github_repository=github_repository,
+            github_repository=github_repository,
         )
 
     # -- Action execution persistence --

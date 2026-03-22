@@ -1,0 +1,103 @@
+[
+  {
+    "id": "fix-divide-by-zero",
+    "task": "Fix the divide-by-zero bug in safeDivide in src/components/MathUtils.jsx. It should return 0 when the divisor is 0 instead of Infinity. Update the corresponding test in src/components/__tests__/MathUtils.test.jsx so the divide-by-zero test expects 0 instead of Infinity.",
+    "category": "bugfix"
+  },
+  {
+    "id": "add-dark-mode-toggle",
+    "task": "Add a dark mode toggle button to the Header component. When toggled, the header background should switch between #282c34 (dark) and #f0f0f0 (light), and the text color should invert accordingly. Use useState to manage the state.",
+    "category": "feature"
+  },
+  {
+    "id": "refactor-auth-context",
+    "task": "Refactor the Auth component (src/components/Auth.jsx) to use React Context instead of local state. Create src/context/AuthContext.jsx that exports an AuthProvider and a useAuth hook providing { user, login, logout, error }. Update Auth.jsx to call useAuth() instead of using local useState for user/error. IMPORTANT: Auth.jsx must still render exactly the same DOM structure and keep these contracts: heading <h2>Login</h2>, inputs with data-testid='username-input' and data-testid='password-input', a <button>Login</button>, an error <p data-testid='auth-error'>, a welcome <h2>Welcome, {username}</h2>, and a <button>Logout</button>. The hardcoded credentials check (admin/password) must remain. Wrap the <Auth /> in <AuthProvider> inside the Auth test file (src/components/__tests__/Auth.test.jsx) so every existing test keeps passing.",
+    "category": "refactor"
+  },
+  {
+    "id": "add-todo-delete",
+    "task": "Add a delete button to each todo item in TodoList.jsx. Inside each <li data-testid='todo-item'>, after the todo text span, add a <button> with text 'X' that removes that todo from the list. IMPORTANT: The existing click-to-toggle behaviour on the todo text must still work — clicking the todo text (not the X button) must toggle the done state and apply style text-decoration: line-through. To avoid the delete button click toggling the item, call e.stopPropagation() on the delete button's onClick. Add a new test in src/components/__tests__/TodoList.test.jsx that adds a todo, clicks the X button, and verifies the item is removed. All 4 existing tests must keep passing unchanged.",
+    "category": "feature"
+  },
+  {
+    "id": "add-todo-filter",
+    "task": "Add filter buttons (All, Active, Completed) to the TodoList component. The buttons should filter the displayed todos based on their done status. The 'All' filter should be selected by default.",
+    "category": "feature"
+  },
+  {
+    "id": "add-counter-step",
+    "task": "Add a configurable step size to the Counter component. Add a number input that lets the user set the step (default 1). The Increment and Decrement buttons should use this step value. Update existing Counter tests to still pass.",
+    "category": "feature"
+  },
+  {
+    "id": "add-profile-edit",
+    "task": "Add an Edit button to the UserProfile component. When clicked, the profile fields (name, email, role) should become editable input fields. Add a Save button that commits the changes and returns to view mode.",
+    "category": "feature"
+  },
+  {
+    "id": "add-form-validation",
+    "task": "Add client-side form validation to the Auth component (src/components/Auth.jsx). When the Login button is clicked: if username is empty AND password is empty, the existing behaviour must remain — show 'Username and password are required' in the <p data-testid='auth-error'> element. NEW: if username is provided but is less than 3 characters, show 'Username must be at least 3 characters' in a <p data-testid='username-error'> below the username input. If password is provided but is less than 6 characters, show 'Password must be at least 6 characters' in a <p data-testid='password-error'> below the password input. The validation errors are only shown after clicking Login (not on every keystroke). The existing 5 tests in src/components/__tests__/Auth.test.jsx must continue to pass without modification. Add new tests for the two validation cases in the same test file.",
+    "category": "feature"
+  },
+  {
+    "id": "extract-use-fetch-hook",
+    "task": "Extract the data fetching logic in UserProfile.jsx into a reusable custom hook called useFetch in src/hooks/useFetch.js. The hook should accept a URL or async function and return { data, loading, error }. Refactor UserProfile.jsx to use useFetch internally. IMPORTANT: The rendered DOM must remain identical — while loading show the exact text 'Loading profile...', and after loading show <p data-testid='profile-name'>Jane Doe</p>, <p data-testid='profile-email'>jane@example.com</p>, <p data-testid='profile-role'>Developer</p>. The simulated fetch (setTimeout with the hardcoded user object) must stay in UserProfile.jsx as the fetch function passed to the hook. The 2 existing tests in src/components/__tests__/UserProfile.test.jsx must pass without any changes.",
+    "category": "refactor"
+  },
+  {
+    "id": "add-localstorage-todos",
+    "task": "Persist the todo list to localStorage in the TodoList component (src/components/TodoList.jsx). On mount, read the key 'todos' from localStorage and initialise the todos state with the parsed JSON (or an empty array if nothing is stored). Use a useEffect hook to write JSON.stringify(todos) to localStorage under the key 'todos' whenever the todos array changes. IMPORTANT: Do NOT change the rendered DOM structure, data-testid attributes, or the click-to-toggle inline style (text-decoration: line-through). All 4 existing tests in src/components/__tests__/TodoList.test.jsx must continue to pass. Note: the jsdom test environment provides a working localStorage, so no mocking is needed.",
+    "category": "feature"
+  },
+  {
+    "id": "add-404-page",
+    "task": "Add a 404 Not Found page component in src/components/NotFound.jsx. It should display a heading '404 — Page Not Found' and a link back to the home page. Add a catch-all route in App.jsx that renders this component for unknown paths.",
+    "category": "feature"
+  },
+  {
+    "id": "add-loading-spinner",
+    "task": "Create a reusable LoadingSpinner component in src/components/LoadingSpinner.jsx that displays an animated CSS spinner. Use it in UserProfile.jsx to replace the plain 'Loading profile...' text. Add a basic test that the spinner renders.",
+    "category": "feature"
+  },
+  {
+    "id": "add-counter-max-min",
+    "task": "Add min and max bounds to the Counter component. The counter should not go below 0 or above 100. Disable the Increment button at 100 and the Decrement button at 0. Update existing tests and add new tests for the bounds.",
+    "category": "feature"
+  },
+  {
+    "id": "add-todo-count-badge",
+    "task": "Add a badge next to the 'Todos' nav link in App.jsx that shows the number of active (not done) todos. Approach: create a simple React context (src/context/TodoContext.jsx) that holds the todos array and exposes it via a useTodos hook. Wrap the app in this provider inside App.jsx. Update TodoList.jsx to read and write todos through the context instead of local useState. In App.jsx, consume the context to compute the active count and render it as a <span data-testid='todo-count-badge'> right after the Todos link text. IMPORTANT: TodoList.jsx must keep the exact same DOM structure — <h2>Todo List</h2>, <input data-testid='todo-input'>, <button>Add</button>, <li data-testid='todo-item'> with inline style text-decoration: line-through for done items and cursor: pointer. All 4 existing TodoList tests must pass without modification.",
+    "category": "feature"
+  },
+  {
+    "id": "fix-header-accessibility",
+    "task": "Fix accessibility issues in the Header component. Add a role='banner' attribute to the header element, ensure the heading level is semantically correct, and add an aria-label. Add a test that verifies the role attribute is present.",
+    "category": "bugfix"
+  },
+  {
+    "id": "add-keyboard-support-todo",
+    "task": "Add keyboard support to the TodoList component. Pressing Enter in the input field should add the todo (same as clicking Add). Add a test that simulates pressing Enter and verifies the todo is added.",
+    "category": "feature"
+  },
+  {
+    "id": "refactor-inline-styles",
+    "task": "Refactor the inline styles in TodoList.jsx to use a CSS module. Create src/components/TodoList.module.css with the equivalent styles. Replace the inline style objects on the <li> elements with className references from the CSS module. IMPORTANT: The existing test 'toggles a todo item' asserts expect(item).toHaveStyle('text-decoration: line-through'). CSS modules in the jsdom/Vitest environment do NOT apply real styles, so toHaveStyle will fail. To fix this, update the toggle test in src/components/__tests__/TodoList.test.jsx to instead check for the presence of a CSS class (e.g. expect(item.className).toContain('done') or similar) rather than toHaveStyle. All other existing tests must keep passing. The DOM structure (<h2>Todo List</h2>, <input data-testid='todo-input'>, <button>Add</button>, <li data-testid='todo-item'>) must remain unchanged.",
+    "category": "refactor"
+  },
+  {
+    "id": "add-factorial-memoization",
+    "task": "Add memoization to the factorial function in MathUtils.jsx using a simple cache object. Previously computed values should be stored and returned without re-computing. Add a test that verifies the cached path returns the correct result.",
+    "category": "performance"
+  },
+  {
+    "id": "add-error-boundary",
+    "task": "Create an ErrorBoundary class component in src/components/ErrorBoundary.jsx that catches rendering errors and displays a fallback UI with the message 'Something went wrong.' Wrap the Routes in App.jsx with this ErrorBoundary. Add a test for the ErrorBoundary.",
+    "category": "feature"
+  },
+  {
+    "id": "add-search-filter-todos",
+    "task": "Add a search/filter input above the todo list in TodoList.jsx. Add a new <input data-testid='todo-search' placeholder='Search todos...' /> between the add-todo controls and the <ul>. Use a new useState for the search term. Filter the displayed todos so only those whose text includes the search term (case-insensitive) are shown. IMPORTANT: Do NOT change the existing DOM structure — keep <h2>Todo List</h2>, <input data-testid='todo-input'>, <button>Add</button>, <li data-testid='todo-item'> with the inline style text-decoration: line-through for done items and cursor: pointer. The search only affects which items are rendered, not the underlying todos state. All 4 existing tests in src/components/__tests__/TodoList.test.jsx must pass without modification. Add a new test in the same file that adds two todos ('Buy milk' and 'Walk dog'), types 'milk' into the search input, and asserts only 'Buy milk' is visible.",
+    "category": "feature"
+  }
+]
+

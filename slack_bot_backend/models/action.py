@@ -54,6 +54,8 @@ class AiderResult(BaseModel):
     stdout: str
     stderr: str
     returncode: int
+    test_attempts: int = 0
+    test_output: str = ""
 
 
 class EvaluationResult(BaseModel):

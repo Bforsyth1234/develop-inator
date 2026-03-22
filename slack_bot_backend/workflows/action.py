@@ -122,6 +122,7 @@ class ActionWorkflow:
         github_repository: str = "",
         supabase: SupabaseRepository | None = None,
         model_tier_map: dict[str, str] | None = None,
+        aider_bin: str | None = None,
     ) -> None:
         self.slack = slack
         self.git = git
@@ -130,6 +131,7 @@ class ActionWorkflow:
         self.github_repository = github_repository
         self.supabase = supabase
         self.model_tier_map: dict[str, str] = dict(model_tier_map or _MODEL_TIER_MAP)
+        self.aider_bin = aider_bin
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -149,6 +151,8 @@ class ActionWorkflow:
                 request, optimized_prompt=optimized_prompt, model=selected_model,
             )
             if aider_result.returncode != 0:
+                if aider_result.test_attempts > 0:
+                    return await self._handle_test_failure(request, aider_result)
                 return await self._handle_failure(request, aider_result)
             return await self._handle_success(request, aider_result, model=selected_model)
         except Exception:
@@ -254,6 +258,46 @@ class ActionWorkflow:
             cwd=self.repo_path,
         )
 
+    # ------------------------------------------------------------------
+    # Test validation helpers
+    # ------------------------------------------------------------------
+
+    _MAX_TEST_ATTEMPTS = 3
+
+    def _detect_test_command(self) -> list[str] | None:
+        """Detect the test command for the repository. Returns None if unknown."""
+        repo = Path(self.repo_path)
+        # Node / npm projects
+        if (repo / "package.json").exists():
+            return ["npm", "test"]
+        # Python / pytest projects
+        if (repo / "pytest.ini").exists():
+            return ["pytest"]
+        pyproject = repo / "pyproject.toml"
+        if pyproject.exists():
+            try:
+                content = pyproject.read_text()
+                if "[tool.pytest" in content:
+                    return ["pytest"]
+            except OSError:
+                pass
+        if (repo / "tests").is_dir():
+            return ["pytest"]
+        return None
+
+    async def _run_test_command(
+        self, test_cmd: list[str], env: dict[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the test suite and return the completed process."""
+        return await asyncio.to_thread(
+            subprocess.run,
+            test_cmd,
+            capture_output=True,
+            text=True,
+            cwd=self.repo_path,
+            env=env,
+        )
+
     async def _run_aider(
         self, request: ActionRequest, *, optimized_prompt: str, model: str
     ) -> AiderResult:
@@ -296,8 +340,11 @@ class ActionWorkflow:
             )
 
         # 2. Run Aider non-interactively with the routed model
-        venv_bin = Path(sys.executable).parent
-        aider_bin = str(venv_bin / "aider")
+        if self.aider_bin:
+            aider_bin = self.aider_bin
+        else:
+            venv_bin = Path(sys.executable).parent
+            aider_bin = str(venv_bin / "aider")
         aider_cmd = [
             aider_bin,
             "--model", model,
@@ -357,7 +404,85 @@ class ActionWorkflow:
                 returncode=aider_proc.returncode or 1,
             )
 
-        # 3. Push the branch to origin
+        # 3. Run test validation loop (if a test framework is detected)
+        test_cmd = self._detect_test_command()
+        test_attempts = 0
+        last_test_output = ""
+        if test_cmd is not None:
+            for attempt in range(self._MAX_TEST_ATTEMPTS):
+                test_attempts = attempt + 1
+                logger.info(
+                    "Running test suite (attempt %d/%d)",
+                    test_attempts,
+                    self._MAX_TEST_ATTEMPTS,
+                    extra={"branch": branch_name, "channel": request.channel},
+                )
+                test_proc = await self._run_test_command(test_cmd, subprocess_env)
+                last_test_output = (
+                    (test_proc.stderr or "")
+                    + "\n"
+                    + (test_proc.stdout or "")[-2000:]
+                )
+                if test_proc.returncode == 0:
+                    logger.info(
+                        "Tests passed on attempt %d", test_attempts,
+                        extra={"branch": branch_name, "channel": request.channel},
+                    )
+                    break
+
+                logger.warning(
+                    "Tests failed on attempt %d/%d",
+                    test_attempts,
+                    self._MAX_TEST_ATTEMPTS,
+                    extra={"branch": branch_name, "channel": request.channel},
+                )
+
+                # If we still have retries left, feed failure back to Aider
+                if test_attempts < self._MAX_TEST_ATTEMPTS:
+                    fix_prompt = (
+                        "The tests failed with the following output. "
+                        "Please fix the failing tests:\n\n"
+                        f"```\n{last_test_output}\n```"
+                    )
+                    retry_cmd = [
+                        aider_bin,
+                        "--model", model,
+                        "--yes-always",
+                        "--no-show-model-warnings",
+                        "--message", fix_prompt,
+                    ]
+                    await asyncio.to_thread(
+                        subprocess.run,
+                        retry_cmd,
+                        capture_output=True,
+                        text=True,
+                        cwd=self.repo_path,
+                        env=subprocess_env,
+                    )
+            else:
+                # All attempts exhausted — tests still failing
+                logger.error(
+                    "Tests failed after %d attempts; aborting",
+                    self._MAX_TEST_ATTEMPTS,
+                    extra={"branch": branch_name, "channel": request.channel},
+                )
+                await self._git("checkout", base_branch)
+                await self._git("branch", "-D", branch_name)
+                if did_stash:
+                    await self._git("stash", "pop")
+                return AiderResult(
+                    branch_name=branch_name,
+                    stdout=aider_proc.stdout,
+                    stderr=(
+                        f"[bot] Tests failed after {self._MAX_TEST_ATTEMPTS} "
+                        f"attempts.\n{last_test_output}"
+                    ),
+                    returncode=1,
+                    test_attempts=test_attempts,
+                    test_output=last_test_output,
+                )
+
+        # 4. Push the branch to origin
         push_proc = await self._git("push", "origin", branch_name)
         if push_proc.returncode != 0:
             await self._git("checkout", base_branch)
@@ -370,7 +495,7 @@ class ActionWorkflow:
                 returncode=push_proc.returncode,
             )
 
-        # 4. Return to base branch and restore stash
+        # 5. Return to base branch and restore stash
         await self._git("checkout", base_branch)
         if did_stash:
             await self._git("stash", "pop")
@@ -380,6 +505,8 @@ class ActionWorkflow:
             stdout=aider_proc.stdout,
             stderr=aider_proc.stderr,
             returncode=0,
+            test_attempts=test_attempts,
+            test_output=last_test_output,
         )
 
     # ------------------------------------------------------------------
@@ -434,6 +561,27 @@ class ActionWorkflow:
             f":x: Aider failed (exit {aider_result.returncode}).\n\n"
             f"*stderr:*\n```\n{stderr_snippet}\n```\n\n"
             f"*stdout:*\n```\n{stdout_snippet}\n```"
+        )
+        await self._post_message(request, message)
+        return ActionRouteResult(status="error", provider="aider", message=message)
+
+    async def _handle_test_failure(
+        self, request: ActionRequest, aider_result: AiderResult
+    ) -> ActionRouteResult:
+        logger.error(
+            "Tests failed after %d attempts",
+            aider_result.test_attempts,
+            extra={
+                "branch": aider_result.branch_name,
+                "channel": request.channel,
+                "thread_ts": request.thread_ts,
+            },
+        )
+        test_snippet = aider_result.test_output[-1500:] or "(empty)"
+        message = (
+            f":x: Aider made changes but the tests failed after "
+            f"{aider_result.test_attempts} attempts.\n\n"
+            f"*Test output:*\n```\n{test_snippet}\n```"
         )
         await self._post_message(request, message)
         return ActionRouteResult(status="error", provider="aider", message=message)

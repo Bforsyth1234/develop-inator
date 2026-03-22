@@ -65,6 +65,7 @@ class Settings(BaseModel):
     github_token: str | None = Field(default=None, repr=False)
     github_repository: str | None = None
     github_webhook_secret: str | None = Field(default=None, repr=False)
+    github_bot_username: str = "develop-inator[bot]"
 
     # Cohere reranking (optional – when set, hybrid search results are
     # reranked with the Cohere Rerank API before being returned).
@@ -133,6 +134,7 @@ class Settings(BaseModel):
             "github_token": source.get("SLACK_BOT_GITHUB_TOKEN"),
             "github_repository": source.get("SLACK_BOT_GITHUB_REPOSITORY"),
             "github_webhook_secret": source.get("SLACK_BOT_GITHUB_WEBHOOK_SECRET"),
+            "github_bot_username": source.get("SLACK_BOT_GITHUB_BOT_USERNAME"),
             "repo_path": source.get("SLACK_BOT_REPO_PATH"),
             "aider_model_simple": source.get("AIDER_MODEL_SIMPLE"),
             "aider_model_complex": source.get("AIDER_MODEL_COMPLEX"),

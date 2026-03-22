@@ -20,6 +20,7 @@ from slack_bot_backend.models.action import (
     AiderResult,
     EvaluationResult,
 )
+from slack_bot_backend.models.persistence import ActivePullRequestRecord
 from slack_bot_backend.services.interfaces import LanguageModel, PullRequestDraft, SlackGateway, SupabaseRepository
 
 logger = logging.getLogger(__name__)
@@ -204,6 +205,135 @@ class ActionWorkflow:
             )
             await self._post_message(request, message)
             return ActionRouteResult(status="error", provider="error", message=message)
+
+    # ------------------------------------------------------------------
+    # PR comment handler (GitHub webhook → Slack → Aider)
+    # ------------------------------------------------------------------
+
+    async def handle_pr_comment(
+        self,
+        *,
+        pr_url: str,
+        comment_body: str,
+        sender: str,
+    ) -> None:
+        """Orchestrate a response to a GitHub PR comment.
+
+        1. Look up the PR → Slack thread mapping in Supabase.
+        2. Post a notification to the original Slack thread.
+        3. Evaluate the comment's complexity.
+        4. Simple → run Aider on existing branch and push.
+        5. Complex → generate a spec and post for approval.
+        """
+        if self.supabase is None:
+            logger.warning("handle_pr_comment called but Supabase is not configured")
+            return
+
+        # 1. Look up PR mapping
+        mapping = await self.supabase.get_pr_mapping_by_url(pr_url)
+        if mapping is None:
+            logger.info(
+                "No PR mapping found for comment; ignoring",
+                extra={"pr_url": pr_url},
+            )
+            return
+
+        channel_id = mapping.channel_id
+        thread_ts = mapping.thread_ts
+        branch_name = mapping.branch_name
+
+        # 2. Notify Slack thread
+        comment_excerpt = comment_body[:200] + ("…" if len(comment_body) > 200 else "")
+        try:
+            await self.slack.post_message(
+                channel_id,
+                f':eyes: I saw a comment from *{sender}* on the PR:\n> "{comment_excerpt}"\n\n'
+                "I'm looking into it now…",
+                thread_ts=thread_ts,
+            )
+        except Exception:
+            logger.warning("Failed to post PR comment notification to Slack", exc_info=True)
+
+        # 3. Evaluate the comment through the pre-flight evaluator
+        synthetic_request = ActionRequest(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            request=comment_body,
+        )
+        eval_result = await self._evaluate_request(synthetic_request)
+
+        if not eval_result.is_actionable:
+            # Comment is too vague — ask for clarification in the thread
+            question = (
+                eval_result.clarifying_question
+                or "Could you provide more details about what you'd like changed?"
+            )
+            try:
+                await self.slack.post_message(
+                    channel_id,
+                    f":thinking_face: {question}",
+                    thread_ts=thread_ts,
+                )
+            except Exception:
+                logger.warning("Failed to post clarification to Slack", exc_info=True)
+            return
+
+        optimized_prompt = eval_result.optimized_prompt or comment_body
+        selected_model = self.model_tier_map.get(
+            eval_result.complexity_tier,
+            self.model_tier_map["simple"],
+        )
+
+        # 4. Complex → generate spec and post for approval
+        if eval_result.complexity_tier == "complex":
+            await self._handle_complex_plan(
+                synthetic_request,
+                optimized_prompt=optimized_prompt,
+                model=selected_model,
+            )
+            return
+
+        # 5. Simple → run Aider on existing branch
+        try:
+            aider_result = await self._run_aider(
+                synthetic_request,
+                optimized_prompt=optimized_prompt,
+                model=selected_model,
+                existing_branch=branch_name,
+            )
+        except Exception:
+            logger.exception("Aider run failed for PR comment feedback")
+            try:
+                await self.slack.post_message(
+                    channel_id,
+                    ":x: I hit an error trying to address the PR comment. Please check the logs.",
+                    thread_ts=thread_ts,
+                )
+            except Exception:
+                logger.warning("Failed to post error to Slack", exc_info=True)
+            return
+
+        if aider_result.returncode != 0:
+            stderr_snippet = aider_result.stderr[-500:] or "(empty)"
+            try:
+                await self.slack.post_message(
+                    channel_id,
+                    f":x: Aider couldn't apply the fix (exit {aider_result.returncode}).\n"
+                    f"```\n{stderr_snippet}\n```",
+                    thread_ts=thread_ts,
+                )
+            except Exception:
+                logger.warning("Failed to post failure to Slack", exc_info=True)
+            return
+
+        try:
+            await self.slack.post_message(
+                channel_id,
+                ":white_check_mark: I've pushed a fix for your comment to the PR.",
+                thread_ts=thread_ts,
+            )
+        except Exception:
+            logger.warning("Failed to post success to Slack", exc_info=True)
 
     # ------------------------------------------------------------------
     # Pre-flight evaluator
@@ -423,15 +553,32 @@ class ActionWorkflow:
             env["ANTHROPIC_API_KEY"] = llm_key
         return env
 
+    _GIT_TIMEOUT = 120  # seconds
+    _AIDER_TIMEOUT = 600  # 10 minutes
+    _TEST_TIMEOUT = 300  # 5 minutes
+
     async def _git(self, *args: str) -> subprocess.CompletedProcess[str]:
         """Run a git command in the target repo."""
-        return await asyncio.to_thread(
-            subprocess.run,
-            ["git", *args],
-            capture_output=True,
-            text=True,
-            cwd=self.repo_path,
-        )
+        logger.debug("Running git %s", " ".join(args))
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                ["git", *args],
+                capture_output=True,
+                text=True,
+                cwd=self.repo_path,
+                timeout=self._GIT_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            logger.error("git %s timed out after %ds", args[0] if args else "?", self._GIT_TIMEOUT)
+            return subprocess.CompletedProcess(
+                args=["git", *args],
+                returncode=1,
+                stdout="",
+                stderr=f"[bot] git {args[0] if args else '?'} timed out after {self._GIT_TIMEOUT}s",
+            )
+        logger.debug("git %s → exit %d", args[0] if args else "?", result.returncode)
+        return result
 
     # ------------------------------------------------------------------
     # Test validation helpers
@@ -464,55 +611,89 @@ class ActionWorkflow:
         self, test_cmd: list[str], env: dict[str, str],
     ) -> subprocess.CompletedProcess[str]:
         """Run the test suite and return the completed process."""
-        return await asyncio.to_thread(
-            subprocess.run,
-            test_cmd,
-            capture_output=True,
-            text=True,
-            cwd=self.repo_path,
-            env=env,
-        )
+        try:
+            return await asyncio.to_thread(
+                subprocess.run,
+                test_cmd,
+                capture_output=True,
+                text=True,
+                cwd=self.repo_path,
+                env=env,
+                timeout=self._TEST_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            logger.error("Test command timed out after %ds: %s", self._TEST_TIMEOUT, test_cmd)
+            return subprocess.CompletedProcess(
+                args=test_cmd,
+                returncode=1,
+                stdout="",
+                stderr=f"[bot] Test command timed out after {self._TEST_TIMEOUT}s",
+            )
 
     async def _run_aider(
-        self, request: ActionRequest, *, optimized_prompt: str, model: str
+        self,
+        request: ActionRequest,
+        *,
+        optimized_prompt: str,
+        model: str,
+        existing_branch: str | None = None,
     ) -> AiderResult:
         if not self.repo_path:
             raise RuntimeError(
                 "repo_path is empty. Set SLACK_BOT_REPO_PATH to an existing local clone."
             )
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        branch_name = f"ai-update-{timestamp}"
         subprocess_env = self._build_subprocess_env()
 
         # 0. Record the current branch so we can return to it on failure,
-        #    stash any dirty working-tree changes, and ensure we branch
-        #    from the *remote* main — not the local HEAD which may have
-        #    stale local-only commits.
+        #    stash any dirty working-tree changes.
         head_ref = await self._git("rev-parse", "--abbrev-ref", "HEAD")
         base_branch = head_ref.stdout.strip() or "main"
 
         stash_result = await self._git("stash", "--include-untracked")
         did_stash = "No local changes" not in (stash_result.stdout or "")
 
-        # Fetch latest remote state so the branch starts clean.
-        await self._git("fetch", "origin", "main")
+        if existing_branch is not None:
+            # ── Existing branch: fetch, checkout, and pull ──
+            branch_name = existing_branch
+            await self._git("fetch", "origin", existing_branch)
+            checkout_proc = await self._git("checkout", existing_branch)
+            if checkout_proc.returncode != 0:
+                if did_stash:
+                    await self._git("stash", "pop")
+                return AiderResult(
+                    branch_name=branch_name,
+                    stdout=checkout_proc.stdout,
+                    stderr=checkout_proc.stderr,
+                    returncode=checkout_proc.returncode,
+                )
+            await self._git("pull", "origin", existing_branch)
+            # Record the current HEAD so we can detect new commits
+            base_sha_proc = await self._git("rev-parse", "HEAD")
+            base_sha = base_sha_proc.stdout.strip()
+        else:
+            # ── New branch: create from origin/main ──
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+            branch_name = f"ai-update-{timestamp}"
 
-        # Record the commit SHA we'll branch from (remote main, not local).
-        base_sha_proc = await self._git("rev-parse", "origin/main")
-        base_sha = base_sha_proc.stdout.strip()
+            # Fetch latest remote state so the branch starts clean.
+            await self._git("fetch", "origin", "main")
 
-        # 1. Create a new branch from origin/main (ignoring local-only commits)
-        checkout_proc = await self._git("checkout", "-b", branch_name, "origin/main")
-        if checkout_proc.returncode != 0:
-            # Restore stash before returning
-            if did_stash:
-                await self._git("stash", "pop")
-            return AiderResult(
-                branch_name=branch_name,
-                stdout=checkout_proc.stdout,
-                stderr=checkout_proc.stderr,
-                returncode=checkout_proc.returncode,
-            )
+            # Record the commit SHA we'll branch from (remote main, not local).
+            base_sha_proc = await self._git("rev-parse", "origin/main")
+            base_sha = base_sha_proc.stdout.strip()
+
+            # 1. Create a new branch from origin/main (ignoring local-only commits)
+            checkout_proc = await self._git("checkout", "-b", branch_name, "origin/main")
+            if checkout_proc.returncode != 0:
+                # Restore stash before returning
+                if did_stash:
+                    await self._git("stash", "pop")
+                return AiderResult(
+                    branch_name=branch_name,
+                    stdout=checkout_proc.stdout,
+                    stderr=checkout_proc.stderr,
+                    returncode=checkout_proc.returncode,
+                )
 
         # 2. Run Aider non-interactively with the routed model
         if self.aider_bin:
@@ -536,14 +717,24 @@ class ActionWorkflow:
                 "channel": request.channel,
             },
         )
-        aider_proc: subprocess.CompletedProcess[str] = await asyncio.to_thread(
-            subprocess.run,
-            aider_cmd,
-            capture_output=True,
-            text=True,
-            cwd=self.repo_path,
-            env=subprocess_env,
-        )
+        try:
+            aider_proc: subprocess.CompletedProcess[str] = await asyncio.to_thread(
+                subprocess.run,
+                aider_cmd,
+                capture_output=True,
+                text=True,
+                cwd=self.repo_path,
+                env=subprocess_env,
+                timeout=self._AIDER_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            logger.error("Aider timed out after %ds", self._AIDER_TIMEOUT)
+            aider_proc = subprocess.CompletedProcess(
+                args=aider_cmd,
+                returncode=1,
+                stdout="",
+                stderr=f"[bot] Aider timed out after {self._AIDER_TIMEOUT}s",
+            )
 
         # 2b. Check if Aider failed or made no changes.
         # Compare current HEAD against the base SHA to see if any new commits
@@ -626,14 +817,18 @@ class ActionWorkflow:
                         "--no-show-model-warnings",
                         "--message", fix_prompt,
                     ]
-                    await asyncio.to_thread(
-                        subprocess.run,
-                        retry_cmd,
-                        capture_output=True,
-                        text=True,
-                        cwd=self.repo_path,
-                        env=subprocess_env,
-                    )
+                    try:
+                        await asyncio.to_thread(
+                            subprocess.run,
+                            retry_cmd,
+                            capture_output=True,
+                            text=True,
+                            cwd=self.repo_path,
+                            env=subprocess_env,
+                            timeout=self._AIDER_TIMEOUT,
+                        )
+                    except subprocess.TimeoutExpired:
+                        logger.error("Aider retry timed out after %ds", self._AIDER_TIMEOUT)
             else:
                 # All attempts exhausted — tests still failing
                 logger.error(
@@ -658,7 +853,15 @@ class ActionWorkflow:
                 )
 
         # 4. Push the branch to origin
-        push_proc = await self._git("push", "origin", branch_name)
+        logger.info(
+            "Pushing branch to origin",
+            extra={"branch": branch_name, "channel": request.channel},
+        )
+        push_proc = await self._git("push", "--force-with-lease", "origin", branch_name)
+        logger.info(
+            "Push completed",
+            extra={"branch": branch_name, "returncode": push_proc.returncode},
+        )
         if push_proc.returncode != 0:
             await self._git("checkout", base_branch)
             if did_stash:
@@ -698,6 +901,14 @@ class ActionWorkflow:
                 body=self._build_pr_body(request, aider_result),
                 branch_name=branch_name,
             )
+        )
+
+        # Persist the PR → Slack thread mapping so we can handle PR comments
+        await self._save_pr_mapping(
+            pr_url=pr_url,
+            branch_name=branch_name,
+            channel_id=request.channel,
+            thread_ts=request.thread_ts,
         )
 
         # Persist the repo config so the bot remembers the last repo it worked with
@@ -776,6 +987,32 @@ class ActionWorkflow:
             f"```\n{stdout_excerpt}\n```\n\n"
             "</details>"
         )
+
+    async def _save_pr_mapping(
+        self,
+        *,
+        pr_url: str,
+        branch_name: str,
+        channel_id: str,
+        thread_ts: str,
+    ) -> None:
+        """Persist PR → Slack thread mapping to Supabase."""
+        if self.supabase is None:
+            return
+        try:
+            await self.supabase.save_pr_mapping(
+                ActivePullRequestRecord(
+                    pr_url=pr_url,
+                    branch_name=branch_name,
+                    channel_id=channel_id,
+                    thread_ts=thread_ts,
+                )
+            )
+        except Exception:
+            logger.warning(
+                "Failed to persist PR mapping to Supabase; continuing",
+                exc_info=True,
+            )
 
     async def _save_repository_config(self) -> None:
         """Persist the current repo_path and github_repository to Supabase."""

@@ -58,6 +58,16 @@ class DocumentationChunkRecord:
 
 
 @dataclass(frozen=True)
+class ActivePullRequestRecord:
+    pr_url: str
+    branch_name: str
+    channel_id: str
+    thread_ts: str
+    status: str = "open"
+    inserted_at: datetime | str | None = None
+
+
+@dataclass(frozen=True)
 class DocumentationMatch:
     source_type: str
     source_id: str

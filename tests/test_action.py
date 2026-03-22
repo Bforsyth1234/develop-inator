@@ -10,7 +10,8 @@ from fastapi.testclient import TestClient
 from slack_bot_backend.config import Settings
 from slack_bot_backend.dependencies import ServiceContainer, get_container
 from slack_bot_backend.main import create_app
-from slack_bot_backend.models.action import ActionExecution, ActionExecutionStatus, ActionRequest, ActionRouteResult, ProposedFileChange, RepositorySearchResult
+from slack_bot_backend.models.action import AiderResult, ActionExecution, ActionExecutionStatus, ActionRequest, ActionRouteResult, ProposedFileChange, RepositorySearchResult
+from slack_bot_backend.models.persistence import ActivePullRequestRecord
 from slack_bot_backend.services.github import GitHubGitService
 from slack_bot_backend.services.interfaces import LLMResult, PullRequestDraft
 from slack_bot_backend.services.stubs import StubGitService, StubLanguageModel, StubSlackGateway, StubSupabaseRepository
@@ -79,10 +80,21 @@ class FakeLanguageModel:
 class FakeSupabaseRepository:
     """Records save_repository_config calls and returns canned get results."""
 
-    def __init__(self, *, stored_config: RepositoryConfig | None = None, fail_save: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        stored_config: RepositoryConfig | None = None,
+        fail_save: bool = False,
+        pr_mapping: ActivePullRequestRecord | None = None,
+        stored_execution: ActionExecution | None = None,
+    ) -> None:
         self._stored_config = stored_config
         self._fail_save = fail_save
+        self._pr_mapping = pr_mapping
+        self._stored_execution = stored_execution
         self.save_calls: list[dict[str, str]] = []
+        self.pr_mapping_saves: list[ActivePullRequestRecord] = []
+        self.execution_status_updates: list[tuple[str, ActionExecutionStatus]] = []
 
     async def healthcheck(self) -> bool:
         return True
@@ -107,7 +119,7 @@ class FakeSupabaseRepository:
         pass
 
     async def get_action_execution(self, execution_id: str) -> ActionExecution | None:
-        return None
+        return self._stored_execution
 
     async def get_pending_execution_for_thread(
         self, *, channel: str, thread_ts: str
@@ -117,7 +129,28 @@ class FakeSupabaseRepository:
     async def update_action_execution_status(
         self, execution_id: str, status: ActionExecutionStatus
     ) -> None:
-        pass
+        self.execution_status_updates.append((execution_id, status))
+
+    # -- PR mapping stubs --
+
+    async def save_pr_mapping(self, record: ActivePullRequestRecord) -> None:
+        self.pr_mapping_saves.append(record)
+
+    async def get_pr_mapping_by_url(self, pr_url: str) -> ActivePullRequestRecord | None:
+        if self._pr_mapping and self._pr_mapping.pr_url == pr_url:
+            return self._pr_mapping
+        return None
+
+    async def get_pr_mapping_by_thread(
+        self, *, channel_id: str, thread_ts: str
+    ) -> ActivePullRequestRecord | None:
+        if (
+            self._pr_mapping
+            and self._pr_mapping.channel_id == channel_id
+            and self._pr_mapping.thread_ts == thread_ts
+        ):
+            return self._pr_mapping
+        return None
 
 
 class FakeActionWorkflow:
@@ -335,10 +368,11 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
         msg_idx = aider_cmd.index("--message") + 1
         self.assertIn("Add a dark-mode toggle", aider_cmd[msg_idx])
 
-        # push uses the same branch
+        # push uses the same branch (git push --force-with-lease origin <branch>)
         self.assertEqual(push_cmd[0], "git")
         self.assertEqual(push_cmd[1], "push")
-        self.assertEqual(push_cmd[3], checkout_cmd[3])
+        self.assertIn("--force-with-lease", push_cmd)
+        self.assertEqual(push_cmd[-1], checkout_cmd[3])
 
     # ------------------------------------------------------------------
     # Evaluator routing tests
@@ -987,6 +1021,234 @@ class TestDetectTestCommand(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             wf = self._make_workflow(d)
             self.assertIsNone(wf._detect_test_command())
+
+
+class ExecuteApprovedTests(unittest.IsolatedAsyncioTestCase):
+    """Tests for the _execute_approved background task in the approval flow."""
+
+    def setUp(self) -> None:
+        patcher = mock.patch.object(
+            ActionWorkflow, "_detect_test_command", return_value=None,
+        )
+        self._no_tests = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _make_execution(self) -> ActionExecution:
+        return ActionExecution(
+            id="exec-001",
+            channel="C123",
+            thread_ts="1710.2",
+            user_id="U456",
+            original_request="Refactor auth module",
+            generated_spec="## Spec\n1. Refactor AuthService",
+            status="approved",
+            model="anthropic/claude-sonnet-4-20250514",
+        )
+
+    def _make_container(
+        self,
+        *,
+        slack: FakeSlackGateway,
+        git: FakeGitService,
+        supabase: FakeSupabaseRepository,
+    ) -> ServiceContainer:
+        llm = FakeLanguageModel()
+        action = ActionWorkflow(
+            slack=slack,
+            git=git,
+            llm=llm,
+            repo_path="/tmp/repo",
+            supabase=supabase,
+            model_tier_map=_DEFAULT_TIER_MAP,
+        )
+        question = QuestionWorkflow(slack=slack, supabase=supabase, llm=llm)
+        return ServiceContainer(
+            settings=Settings(environment="testing"),
+            slack=slack,
+            supabase=supabase,
+            llm=llm,
+            git=git,
+            action=action,
+            intent=IntentWorkflow(
+                slack=slack, supabase=supabase, llm=llm,
+                question=question, action=action,
+            ),
+            question=question,
+        )
+
+    async def test_approved_spec_creates_pr_and_posts_success(self) -> None:
+        """After approval, _execute_approved runs Aider, creates a PR, and posts success."""
+        slack = FakeSlackGateway()
+        git = FakeGitService()
+        execution = self._make_execution()
+        supabase = FakeSupabaseRepository(stored_execution=execution)
+        container = self._make_container(slack=slack, git=git, supabase=supabase)
+
+        with mock.patch(
+            "slack_bot_backend.workflows.action.asyncio.to_thread",
+            side_effect=_make_successful_side_effect(),
+        ):
+            # Import and call the inner function directly
+            from slack_bot_backend.api.routes import _handle_spec_action
+            from starlette.background import BackgroundTasks
+            bg = BackgroundTasks()
+            payload = {
+                "actions": [{"action_id": "approve_spec", "value": "exec-001"}],
+                "container": {"message_ts": "1710.3"},
+            }
+            await _handle_spec_action(container, payload, bg)
+            # Execute the background task
+            await bg.tasks[0].func()
+
+        # PR should have been created
+        self.assertEqual(len(git.pr_calls), 1)
+        # Success message should have been posted to Slack
+        success_msgs = [m for m in slack.messages if "white_check_mark" in (m["text"] or "")]
+        self.assertTrue(len(success_msgs) >= 1)
+        self.assertIn("https://example.invalid/pr/42", success_msgs[0]["text"])
+
+    async def test_approved_spec_with_existing_branch_uses_it(self) -> None:
+        """When a PR mapping exists, _execute_approved passes existing_branch to Aider."""
+        slack = FakeSlackGateway()
+        git = FakeGitService()
+        execution = self._make_execution()
+        pr_mapping = ActivePullRequestRecord(
+            pr_url="https://github.com/owner/repo/pull/10",
+            branch_name="ai-update-existing",
+            channel_id="C123",
+            thread_ts="1710.2",
+        )
+        supabase = FakeSupabaseRepository(stored_execution=execution, pr_mapping=pr_mapping)
+        container = self._make_container(slack=slack, git=git, supabase=supabase)
+
+        captured_cmd: list[list[str]] = []
+        _delegate = _make_git_aware_side_effect()
+
+        async def capture_to_thread(_fn, cmd, **kwargs):
+            captured_cmd.append(cmd)
+            return await _delegate(_fn, cmd, **kwargs)
+
+        with mock.patch(
+            "slack_bot_backend.workflows.action.asyncio.to_thread",
+            side_effect=capture_to_thread,
+        ):
+            from slack_bot_backend.api.routes import _handle_spec_action
+            from starlette.background import BackgroundTasks
+            bg = BackgroundTasks()
+            payload = {
+                "actions": [{"action_id": "approve_spec", "value": "exec-001"}],
+                "container": {"message_ts": "1710.3"},
+            }
+            await _handle_spec_action(container, payload, bg)
+            await bg.tasks[0].func()
+
+        # Should have checked out the existing branch (not created a new one)
+        checkout_cmds = [c for c in captured_cmd if c[0] == "git" and "checkout" in c]
+        # The existing branch flow does checkout + pull, not checkout -b
+        branch_refs = [c for c in captured_cmd if c[0] == "git" and "ai-update-existing" in c]
+        self.assertTrue(len(branch_refs) >= 1, f"Expected existing branch usage, got: {captured_cmd}")
+
+    async def test_approved_spec_aider_failure_posts_error(self) -> None:
+        """When Aider fails, _execute_approved posts an error message to Slack."""
+        slack = FakeSlackGateway()
+        git = FakeGitService()
+        execution = self._make_execution()
+        supabase = FakeSupabaseRepository(stored_execution=execution)
+        container = self._make_container(slack=slack, git=git, supabase=supabase)
+
+        with mock.patch(
+            "slack_bot_backend.workflows.action.asyncio.to_thread",
+            side_effect=_make_git_aware_side_effect(
+                aider_returncode=1,
+                aider_stderr="fatal: aider crashed",
+                aider_stdout="",
+            ),
+        ):
+            from slack_bot_backend.api.routes import _handle_spec_action
+            from starlette.background import BackgroundTasks
+            bg = BackgroundTasks()
+            payload = {
+                "actions": [{"action_id": "approve_spec", "value": "exec-001"}],
+                "container": {"message_ts": "1710.3"},
+            }
+            await _handle_spec_action(container, payload, bg)
+            await bg.tasks[0].func()
+
+        # No PR should have been created
+        self.assertEqual(len(git.pr_calls), 0)
+        # Error message should have been posted
+        error_msgs = [m for m in slack.messages if "exit 1" in (m["text"] or "") or "failed" in (m["text"] or "").lower()]
+        self.assertTrue(len(error_msgs) >= 1, f"Expected error message, got: {[m['text'] for m in slack.messages]}")
+
+    async def test_approved_spec_exception_posts_error_to_slack(self) -> None:
+        """When _run_aider raises an exception, an error message is posted to Slack."""
+        slack = FakeSlackGateway()
+        git = FakeGitService()
+        execution = self._make_execution()
+        supabase = FakeSupabaseRepository(stored_execution=execution)
+        container = self._make_container(slack=slack, git=git, supabase=supabase)
+
+        with mock.patch.object(
+            container.action, "_run_aider", side_effect=RuntimeError("boom"),
+        ):
+            from slack_bot_backend.api.routes import _handle_spec_action
+            from starlette.background import BackgroundTasks
+            bg = BackgroundTasks()
+            payload = {
+                "actions": [{"action_id": "approve_spec", "value": "exec-001"}],
+                "container": {"message_ts": "1710.3"},
+            }
+            await _handle_spec_action(container, payload, bg)
+            await bg.tasks[0].func()
+
+        # Error message should have been posted
+        error_msgs = [m for m in slack.messages if "error" in (m["text"] or "").lower()]
+        self.assertTrue(len(error_msgs) >= 1, f"Expected error message, got: {[m['text'] for m in slack.messages]}")
+
+
+class SubprocessTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    """Tests for subprocess timeout handling in ActionWorkflow."""
+
+    def _make_workflow(self) -> ActionWorkflow:
+        return ActionWorkflow(
+            slack=FakeSlackGateway(),
+            git=FakeGitService(),
+            llm=FakeLanguageModel(),
+            repo_path="/tmp/repo",
+            model_tier_map=_DEFAULT_TIER_MAP,
+        )
+
+    async def test_git_timeout_returns_error_result(self) -> None:
+        """When a git command times out, _git returns a synthetic error."""
+        wf = self._make_workflow()
+
+        async def timeout_side_effect(_fn, cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=120)
+
+        with mock.patch(
+            "slack_bot_backend.workflows.action.asyncio.to_thread",
+            side_effect=timeout_side_effect,
+        ):
+            result = await wf._git("push", "origin", "main")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("timed out", result.stderr)
+
+    async def test_test_command_timeout_returns_error_result(self) -> None:
+        """When a test command times out, _run_test_command returns a synthetic error."""
+        wf = self._make_workflow()
+
+        async def timeout_side_effect(_fn, cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=300)
+
+        with mock.patch(
+            "slack_bot_backend.workflows.action.asyncio.to_thread",
+            side_effect=timeout_side_effect,
+        ):
+            result = await wf._run_test_command(["pytest"], {})
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("timed out", result.stderr)
 
 
 if __name__ == "__main__":

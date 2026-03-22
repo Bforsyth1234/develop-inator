@@ -7,7 +7,7 @@ import logging
 from collections.abc import Sequence
 
 from slack_bot_backend.models.action import ActionExecution, ActionExecutionStatus, ProposedFileChange, RepositorySearchResult
-from slack_bot_backend.models.persistence import DocumentationMatch, JSONValue, SlackThreadMessageRecord
+from slack_bot_backend.models.persistence import ActivePullRequestRecord, DocumentationMatch, JSONValue, SlackThreadMessageRecord
 from slack_bot_backend.services.supabase_persistence import RepositoryConfig
 
 from .interfaces import (
@@ -121,6 +121,19 @@ class StubSupabaseRepository(SupabaseRepository):
             "Stub update_action_execution_status invoked",
             extra={"id": execution_id, "status": status},
         )
+
+    async def save_pr_mapping(self, record: ActivePullRequestRecord) -> None:
+        logger.info("Stub save_pr_mapping invoked", extra={"pr_url": record.pr_url})
+
+    async def get_pr_mapping_by_url(self, pr_url: str) -> ActivePullRequestRecord | None:
+        logger.info("Stub get_pr_mapping_by_url invoked", extra={"pr_url": pr_url})
+        return None
+
+    async def get_pr_mapping_by_thread(
+        self, *, channel_id: str, thread_ts: str
+    ) -> ActivePullRequestRecord | None:
+        logger.info("Stub get_pr_mapping_by_thread invoked", extra={"channel_id": channel_id})
+        return None
 
 
 class StubLanguageModel(LanguageModel):

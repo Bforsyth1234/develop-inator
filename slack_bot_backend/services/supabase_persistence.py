@@ -14,6 +14,7 @@ from urllib import error, parse, request
 from slack_bot_backend.config import get_settings
 from slack_bot_backend.models.action import ActionExecution, ActionExecutionStatus
 from slack_bot_backend.models.persistence import (
+    ActivePullRequestRecord,
     DocumentationChunkRecord,
     DocumentationMatch,
     JSONValue,
@@ -483,6 +484,80 @@ class RepositoryConfigRepository:
             ) from exc
 
 
+class PullRequestRepository:
+    """CRUD for the ``active_pull_requests`` table."""
+
+    _TABLE = "rest/v1/active_pull_requests"
+
+    def __init__(self, transport: AsyncSupabaseTransport) -> None:
+        self._transport = transport
+
+    async def save_pr_mapping(self, record: ActivePullRequestRecord) -> None:
+        payload: dict[str, JSONValue] = {
+            "pr_url": record.pr_url,
+            "branch_name": record.branch_name,
+            "channel_id": record.channel_id,
+            "thread_ts": record.thread_ts,
+            "status": record.status,
+        }
+        await self._transport.request(
+            "POST",
+            self._TABLE,
+            json_body=payload,
+            headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+        )
+
+    async def get_pr_mapping_by_url(self, pr_url: str) -> ActivePullRequestRecord | None:
+        response = await self._transport.request(
+            "GET",
+            self._TABLE,
+            query={
+                "select": "pr_url,branch_name,channel_id,thread_ts,status,inserted_at",
+                "pr_url": f"eq.{pr_url}",
+                "limit": "1",
+            },
+        )
+        rows = response.data
+        if not isinstance(rows, list) or len(rows) == 0:
+            return None
+        row = _expect_mapping(rows[0], "active_pull_requests row")
+        return ActivePullRequestRecord(
+            pr_url=str(row["pr_url"]),
+            branch_name=str(row["branch_name"]),
+            channel_id=str(row["channel_id"]),
+            thread_ts=str(row["thread_ts"]),
+            status=str(row.get("status", "open")),
+            inserted_at=_string_or_none(row.get("inserted_at")),
+        )
+
+    async def get_pr_mapping_by_thread(
+        self, *, channel_id: str, thread_ts: str
+    ) -> ActivePullRequestRecord | None:
+        response = await self._transport.request(
+            "GET",
+            self._TABLE,
+            query={
+                "select": "pr_url,branch_name,channel_id,thread_ts,status,inserted_at",
+                "channel_id": f"eq.{channel_id}",
+                "thread_ts": f"eq.{thread_ts}",
+                "order": "inserted_at.desc",
+                "limit": "1",
+            },
+        )
+        rows = response.data
+        if not isinstance(rows, list) or len(rows) == 0:
+            return None
+        row = _expect_mapping(rows[0], "active_pull_requests row")
+        return ActivePullRequestRecord(
+            pr_url=str(row["pr_url"]),
+            branch_name=str(row["branch_name"]),
+            channel_id=str(row["channel_id"]),
+            thread_ts=str(row["thread_ts"]),
+            status=str(row.get("status", "open")),
+            inserted_at=_string_or_none(row.get("inserted_at")),
+        )
+
+
 class ActionExecutionRepository:
     """CRUD for the ``action_executions`` table (planner / approval flow)."""
 
@@ -577,6 +652,7 @@ class SupabasePersistenceRepository:
         self._documentation = DocumentationChunkRepository(transport)
         self._repo_config = RepositoryConfigRepository(transport)
         self._action_executions = ActionExecutionRepository(transport)
+        self._pull_requests = PullRequestRepository(transport)
 
     async def healthcheck(self) -> bool:
         try:
@@ -649,6 +725,21 @@ class SupabasePersistenceRepository:
         self, execution_id: str, status: ActionExecutionStatus
     ) -> None:
         await self._action_executions.update_status(execution_id, status)
+
+    # -- Pull request mapping persistence --
+
+    async def save_pr_mapping(self, record: ActivePullRequestRecord) -> None:
+        await self._pull_requests.save_pr_mapping(record)
+
+    async def get_pr_mapping_by_url(self, pr_url: str) -> ActivePullRequestRecord | None:
+        return await self._pull_requests.get_pr_mapping_by_url(pr_url)
+
+    async def get_pr_mapping_by_thread(
+        self, *, channel_id: str, thread_ts: str
+    ) -> ActivePullRequestRecord | None:
+        return await self._pull_requests.get_pr_mapping_by_thread(
+            channel_id=channel_id, thread_ts=thread_ts
+        )
 
 
 async def _cohere_rerank(

@@ -73,7 +73,7 @@ class Settings(BaseModel):
 
     # Aider execution
     repo_path: str = ""
-    aider_model_simple: str = "groq/qwen/qwen3-32b"
+    aider_model_simple: str = "groq/llama-3.3-70b-versatile"
     aider_model_complex: str = "anthropic/claude-sonnet-4-20250514"
 
     @model_validator(mode="after")

@@ -26,10 +26,44 @@ ACTION workflow orchestration, Slack `app_mention` ingestion, and automated PR e
 2. Install the package and dev extras:
    `python3 -m pip install -e ".[dev]"`
 3. Copy `.env.example` to `.env` and fill in the credentials you plan to use.
-4. Start the API locally:
-   `uvicorn slack_bot_backend.main:app --reload`
-5. Verify the API is healthy:
-   `curl http://127.0.0.1:8000/api/healthz`
+
+### Running locally
+
+You need four processes running in separate terminals:
+
+```bash
+# 1. Redis (broker for Celery + distributed locks)
+redis-server
+
+# 2. FastAPI server
+uv run uvicorn slack_bot_backend.main:app --reload
+
+# 3. Celery worker (background task execution)
+uv run celery -A slack_bot_backend.celery_app worker --loglevel=info
+
+# 4. ngrok (expose local server for Slack & GitHub webhooks)
+ngrok http 8000
+```
+
+Verify the API is healthy:
+`curl http://127.0.0.1:8000/api/healthz`
+
+### Updating ngrok URL
+
+Every time ngrok restarts you get a new public URL (e.g. `https://abc123.ngrok-free.app`). Update these three places:
+
+**Slack** ([api.slack.com/apps](https://api.slack.com/apps) → your app):
+
+| Setting | URL |
+|---|---|
+| Event Subscriptions → Request URL | `https://<ngrok-url>/api/slack/events` |
+| Interactivity & Shortcuts → Request URL | `https://<ngrok-url>/api/slack/interactions` |
+
+**GitHub** (repo → Settings → Webhooks → your webhook):
+
+| Setting | URL |
+|---|---|
+| Payload URL | `https://<ngrok-url>/api/github/webhook` |
 
 ## Environment variables
 

@@ -34,7 +34,7 @@ class SettingsTests(unittest.TestCase):
                 "SLACK_BOT_LLM_API_KEY": "llm-key",
                 "SLACK_BOT_GIT_PROVIDER": "github",
                 "SLACK_BOT_GITHUB_TOKEN": "token",
-                "SLACK_BOT_GITHUB_REPOSITORY": "owner/repo",
+                "SLACK_BOT_REPO_MAP": '{"owner/repo": "/tmp/repo"}',
             }
         )
 
@@ -50,7 +50,7 @@ class SettingsTests(unittest.TestCase):
         self.assertIs(settings.llm_provider, LLMProvider.ANTHROPIC)
         self.assertIs(settings.git_provider, GitProvider.GITHUB)
         self.assertEqual(settings.github_token, "token")
-        self.assertEqual(settings.github_repository, "owner/repo")
+        self.assertEqual(settings.repo_map, ["owner/repo"])
 
     def test_slack_thread_context_limit_must_be_positive(self) -> None:
         with self.assertRaises(ValidationError):

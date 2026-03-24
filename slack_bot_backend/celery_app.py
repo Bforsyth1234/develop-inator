@@ -197,6 +197,11 @@ async def _execute_approved_spec(container, execution_id: str) -> None:
     except Exception:
         logger.warning("Could not look up PR mapping for thread", exc_info=True)
 
+    # Resolve target repository from thread context (saved during evaluation).
+    target_repo_key = await container.action._get_active_thread_repo(req)
+    if target_repo_key is None and len(container.action.repo_map) == 1:
+        target_repo_key = container.action.repo_map[0]
+
     selected_model = execution.model or container.action.model_tier_map.get("complex", "")
     try:
         aider_result = await container.action._run_aider(
@@ -204,6 +209,7 @@ async def _execute_approved_spec(container, execution_id: str) -> None:
             optimized_prompt=execution.generated_spec,
             model=selected_model,
             existing_branch=existing_branch,
+            target_repo_key=target_repo_key,
         )
         if aider_result.returncode != 0:
             if aider_result.test_attempts > 0:
@@ -211,7 +217,9 @@ async def _execute_approved_spec(container, execution_id: str) -> None:
             else:
                 await container.action._handle_failure(req, aider_result)
         else:
-            await container.action._handle_success(req, aider_result, model=selected_model)
+            await container.action._handle_success(
+                req, aider_result, model=selected_model, target_repo_key=target_repo_key,
+            )
     except Exception:
         logger.exception("Approved spec execution failed")
         try:

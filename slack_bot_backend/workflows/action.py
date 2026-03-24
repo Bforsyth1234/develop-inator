@@ -170,8 +170,7 @@ class ActionWorkflow:
         git: ActionGitOperations,
         llm: LanguageModel,
         github_token: str = "",
-        github_repository: str = "",
-        repo_map: dict[str, str] | None = None,
+        repo_map: list[str] | None = None,
         supabase: SupabaseRepository | None = None,
         model_tier_map: dict[str, str] | None = None,
         aider_bin: str | None = None,
@@ -180,8 +179,7 @@ class ActionWorkflow:
         self.git = git
         self.llm = llm
         self.github_token = github_token
-        self.github_repository = github_repository
-        self.repo_map: dict[str, str] = dict(repo_map or {})
+        self.repo_map: list[str] = list(repo_map or [])
         self.supabase = supabase
         self.model_tier_map: dict[str, str] = dict(model_tier_map or _MODEL_TIER_MAP)
         self.aider_bin = aider_bin
@@ -469,7 +467,7 @@ class ActionWorkflow:
         self, request: ActionRequest, *, active_thread_repo: str | None = None,
     ) -> EvaluationResult:
         """Call the fast evaluator LLM; fail open (treat as actionable) on any error."""
-        repo_keys = list(self.repo_map.keys())
+        repo_keys = list(self.repo_map)
         available_repos = "\n".join(f"  • {k}" for k in repo_keys) if repo_keys else "  (none configured)"
         active_repo_display = active_thread_repo if active_thread_repo else "none"
         prompt = _EVALUATOR_SYSTEM_PROMPT.format(
@@ -491,8 +489,15 @@ class ActionWorkflow:
                 "Pre-flight evaluator raised an exception; defaulting to actionable",
                 exc_info=True,
             )
-        # Fail open: pass the original request straight to Aider (defaults to "simple")
-        return EvaluationResult(is_actionable=True, optimized_prompt=request.request)
+        # Fail open: pass the original request straight to Aider (defaults to "simple").
+        # If there's exactly one repo in the map, default to it so we don't
+        # unnecessarily ask the user for clarification.
+        fallback_repo = next(iter(self.repo_map), None) if len(self.repo_map) == 1 else None
+        return EvaluationResult(
+            is_actionable=True,
+            optimized_prompt=request.request,
+            target_repository=fallback_repo,
+        )
 
     @staticmethod
     def _parse_evaluation(raw: str) -> EvaluationResult | None:
@@ -774,23 +779,21 @@ class ActionWorkflow:
                 stderr=f"[bot] Test command timed out after {self._TEST_TIMEOUT}s",
             )
 
-    def _build_clone_url(self, repository: str | None = None) -> str:
+    def _build_clone_url(self, repository: str) -> str:
         """Build a GitHub clone URL using the ``x-access-token`` scheme.
 
-        *repository* overrides ``self.github_repository`` when provided (used
-        for dynamic multi-repo routing).
+        *repository* is the ``owner/repo`` key from ``repo_map``.
         """
-        resolved = repository or self.github_repository
-        if not resolved:
+        if not repository:
             raise RuntimeError(
-                "github_repository is not set. Configure it via /configure or the "
-                "SLACK_BOT_GITHUB_REPOSITORY environment variable."
+                "target repository is not set. Ensure repo_map is configured "
+                "and the evaluator identifies a target repository."
             )
         if not self.github_token:
             raise RuntimeError(
                 "github_token is not set. Set SLACK_BOT_GITHUB_TOKEN."
             )
-        return f"https://x-access-token:{self.github_token}@github.com/{resolved}.git"
+        return f"https://x-access-token:{self.github_token}@github.com/{repository}.git"
 
     async def _run_aider(
         self,
@@ -1102,7 +1105,8 @@ class ActionWorkflow:
         )
 
         # Persist the repo config so the bot remembers the last repo it worked with
-        await self._save_repository_config(repository=target_repo_key)
+        if target_repo_key:
+            await self._save_repository_config(repository=target_repo_key)
 
         model_info = f"\n_Model: `{model}`_" if model else ""
         message = (
@@ -1210,14 +1214,13 @@ class ActionWorkflow:
             return text.replace(self.github_token, "***")
         return text
 
-    async def _save_repository_config(self, *, repository: str | None = None) -> None:
-        """Persist the current github_repository to Supabase."""
+    async def _save_repository_config(self, *, repository: str) -> None:
+        """Persist the target repository to Supabase."""
         if self.supabase is None:
             return
-        resolved = repository or self.github_repository
         try:
             await self.supabase.save_repository_config(
-                github_repository=resolved,
+                github_repository=repository,
             )
         except Exception:
             logger.warning(

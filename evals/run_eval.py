@@ -98,6 +98,7 @@ class _BypassLLM:
             "clarifying_question": None,
             "optimized_prompt": self._task_prompt,
             "complexity_tier": self._tier,
+            "target_repository": "eval/dummy-react-app",
         })
         return LLMResult(content=payload, provider="bypass-eval")
 
@@ -218,8 +219,7 @@ async def _run_single_task(task_entry: dict, keep_dirs: bool = False, aider_bin:
             slack=slack,
             git=git,
             llm=llm,
-            repo_path=work_dir,
-            github_repository="eval/dummy-react-app",
+            repo_map=["eval/dummy-react-app"],
             supabase=None,
             aider_bin=aider_bin,
         )

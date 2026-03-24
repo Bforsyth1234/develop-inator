@@ -67,6 +67,7 @@ class FakeLanguageModel:
             "clarifying_question": None,
             "optimized_prompt": "Optimized: do the thing in FooComponent",
             "complexity_tier": "simple",
+            "target_repository": "owner/repo",
         }
         self._raise = raise_on_generate
         self.prompts: list[str] = []
@@ -278,16 +279,16 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
         git: FakeGitService,
         llm: FakeLanguageModel | None = None,
         github_token: str = "stub",
-        github_repository: str = "owner/repo",
         model_tier_map: dict[str, str] | None = None,
+        repo_map: list[str] | None = None,
     ) -> ActionWorkflow:
         return ActionWorkflow(
             slack=slack,
             git=git,
             llm=llm or FakeLanguageModel(),
             github_token=github_token,
-            github_repository=github_repository,
             model_tier_map=model_tier_map or _DEFAULT_TIER_MAP,
+            repo_map=repo_map or ["owner/repo"],
         )
 
     async def test_success_opens_pr_and_posts_link_to_slack(self) -> None:
@@ -362,6 +363,7 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "clarifying_question": None,
             "optimized_prompt": "Add a dark-mode toggle to the AppComponent",
             "complexity_tier": "simple",
+            "target_repository": "owner/repo",
         })
         captured_cmd: list[list[str]] = []
         _delegate = _make_git_aware_side_effect()
@@ -413,6 +415,7 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "clarifying_question": None,
             "optimized_prompt": "In LoginComponent set the button colour to #E53935",
             "complexity_tier": "simple",
+            "target_repository": "owner/repo",
         })
         captured_cmd: list[list[str]] = []
         _delegate = _make_git_aware_side_effect()
@@ -520,6 +523,7 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "clarifying_question": None,
             "optimized_prompt": "Change the button text in HeaderComponent to 'Sign In'",
             "complexity_tier": "simple",
+            "target_repository": "owner/repo",
         })
         captured_cmd: list[list[str]] = []
         _delegate = _make_git_aware_side_effect()
@@ -550,6 +554,7 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "clarifying_question": None,
             "optimized_prompt": "Refactor AuthService to use NgRx store for session state",
             "complexity_tier": "complex",
+            "target_repository": "owner/repo",
         })
 
         # The planner LLM call (second generate call) returns a spec string
@@ -638,8 +643,8 @@ class ActionWorkflowRepoConfigTests(unittest.IsolatedAsyncioTestCase):
             git=git,
             llm=FakeLanguageModel(),
             github_token="stub",
-            github_repository="owner/my-repo",
             supabase=supabase,
+            repo_map=["owner/repo"],
             model_tier_map=_DEFAULT_TIER_MAP,
         )
 
@@ -653,7 +658,7 @@ class ActionWorkflowRepoConfigTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.status, "completed")
         self.assertEqual(len(supabase.save_calls), 1)
-        self.assertEqual(supabase.save_calls[0]["github_repository"], "owner/my-repo")
+        self.assertEqual(supabase.save_calls[0]["github_repository"], "owner/repo")
 
     async def test_success_without_supabase_skips_config_save(self) -> None:
         slack = FakeSlackGateway()
@@ -664,8 +669,8 @@ class ActionWorkflowRepoConfigTests(unittest.IsolatedAsyncioTestCase):
             git=git,
             llm=FakeLanguageModel(),
             github_token="stub",
-            github_repository="owner/repo",
             model_tier_map=_DEFAULT_TIER_MAP,
+            repo_map=["owner/repo"],
         )
 
         with mock.patch(
@@ -689,9 +694,9 @@ class ActionWorkflowRepoConfigTests(unittest.IsolatedAsyncioTestCase):
             git=git,
             llm=FakeLanguageModel(),
             github_token="stub",
-            github_repository="owner/repo",
             supabase=supabase,
             model_tier_map=_DEFAULT_TIER_MAP,
+            repo_map=["owner/repo"],
         )
 
         with mock.patch(
@@ -716,9 +721,9 @@ class ActionWorkflowRepoConfigTests(unittest.IsolatedAsyncioTestCase):
             git=git,
             llm=FakeLanguageModel(),
             github_token="stub",
-            github_repository="owner/repo",
             supabase=supabase,
             model_tier_map=_DEFAULT_TIER_MAP,
+            repo_map=["owner/repo"],
         )
 
         with mock.patch(
@@ -878,15 +883,14 @@ class TestValidationLoopTests(unittest.IsolatedAsyncioTestCase):
         git: FakeGitService,
         llm: FakeLanguageModel | None = None,
         github_token: str = "stub",
-        github_repository: str = "owner/repo",
     ) -> ActionWorkflow:
         return ActionWorkflow(
             slack=slack,
             git=git,
             llm=llm or FakeLanguageModel(),
             github_token=github_token,
-            github_repository=github_repository,
             model_tier_map=_DEFAULT_TIER_MAP,
+            repo_map=["owner/repo"],
         )
 
     async def test_tests_pass_on_first_attempt_proceeds_to_pr(self) -> None:
@@ -1012,8 +1016,8 @@ class TestDetectTestCommand(unittest.TestCase):
             git=FakeGitService(),
             llm=FakeLanguageModel(),
             github_token="stub",
-            github_repository="owner/repo",
             model_tier_map=_DEFAULT_TIER_MAP,
+            repo_map=["owner/repo"],
         )
 
     def test_detects_npm_from_package_json(self) -> None:
@@ -1087,9 +1091,9 @@ class ExecuteApprovedTests(unittest.IsolatedAsyncioTestCase):
             git=git,
             llm=llm,
             github_token="stub",
-            github_repository="owner/repo",
             supabase=supabase,
             model_tier_map=_DEFAULT_TIER_MAP,
+            repo_map=["owner/repo"],
         )
         question = QuestionWorkflow(slack=slack, supabase=supabase, llm=llm)
         return ServiceContainer(
@@ -1209,8 +1213,8 @@ class SubprocessTimeoutTests(unittest.IsolatedAsyncioTestCase):
             git=FakeGitService(),
             llm=FakeLanguageModel(),
             github_token="stub",
-            github_repository="owner/repo",
             model_tier_map=_DEFAULT_TIER_MAP,
+            repo_map=["owner/repo"],
         )
 
     async def test_git_timeout_returns_error_result(self) -> None:

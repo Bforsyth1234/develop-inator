@@ -73,7 +73,7 @@ class _NoOpGit:
     def __init__(self) -> None:
         self.last_draft: PullRequestDraft | None = None
 
-    async def create_pull_request(self, draft: PullRequestDraft) -> str:
+    async def create_pull_request(self, draft: PullRequestDraft, *, repository: str | None = None) -> str:
         self.last_draft = draft
         return f"https://github.com/fake/repo/pull/0#{draft.branch_name}"
 

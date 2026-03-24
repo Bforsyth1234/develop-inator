@@ -135,6 +135,27 @@ class StubSupabaseRepository(SupabaseRepository):
         logger.info("Stub get_pr_mapping_by_thread invoked", extra={"channel_id": channel_id})
         return None
 
+    async def get_thread_context(
+        self, *, channel_id: str, thread_ts: str
+    ) -> str | None:
+        logger.info(
+            "Stub get_thread_context invoked",
+            extra={"channel_id": channel_id, "thread_ts": thread_ts},
+        )
+        return None
+
+    async def upsert_thread_context(
+        self, *, channel_id: str, thread_ts: str, target_repository: str
+    ) -> None:
+        logger.info(
+            "Stub upsert_thread_context invoked",
+            extra={
+                "channel_id": channel_id,
+                "thread_ts": thread_ts,
+                "target_repository": target_repository,
+            },
+        )
+
 
 class StubLanguageModel(LanguageModel):
     async def generate(self, prompt: str) -> LLMResult:
@@ -191,8 +212,8 @@ class StubLanguageModel(LanguageModel):
 
 
 class StubGitService(GitService):
-    async def create_pull_request(self, draft: PullRequestDraft) -> str:
-        logger.info("Stub Git service invoked", extra={"branch_name": draft.branch_name})
+    async def create_pull_request(self, draft: PullRequestDraft, *, repository: str | None = None) -> str:
+        logger.info("Stub Git service invoked", extra={"branch_name": draft.branch_name, "repository": repository})
         return "stub-pr-url"
 
     async def search_repository(

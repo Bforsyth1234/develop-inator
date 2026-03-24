@@ -99,6 +99,16 @@ class SupabaseRepository(Protocol):
         self, *, channel_id: str, thread_ts: str
     ) -> ActivePullRequestRecord | None: ...
 
+    # -- Thread context (thread memory) --
+
+    async def get_thread_context(
+        self, *, channel_id: str, thread_ts: str
+    ) -> str | None: ...
+
+    async def upsert_thread_context(
+        self, *, channel_id: str, thread_ts: str, target_repository: str
+    ) -> None: ...
+
 
 class LanguageModel(Protocol):
     async def generate(self, prompt: str) -> LLMResult: ...
@@ -107,7 +117,7 @@ class LanguageModel(Protocol):
 
 
 class GitService(Protocol):
-    async def create_pull_request(self, draft: PullRequestDraft) -> str: ...
+    async def create_pull_request(self, draft: PullRequestDraft, *, repository: str | None = None) -> str: ...
 
     async def search_repository(
         self,

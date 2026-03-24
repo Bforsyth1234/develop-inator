@@ -82,6 +82,7 @@ def build_service_container(settings: Settings) -> ServiceContainer:
         supabase=supabase,
         github_token=settings.github_token or "",
         github_repository=github_repository,
+        repo_map=settings.repo_map,
         settings=settings,
     )
     question = QuestionWorkflow(
@@ -263,6 +264,7 @@ def _build_action_workflow(
     supabase: SupabaseRepository,
     github_token: str,
     github_repository: str,
+    repo_map: dict[str, str] | None = None,
     settings: Settings,
 ) -> ActionWorkflow:
     from .workflows.action import ActionWorkflow
@@ -273,6 +275,7 @@ def _build_action_workflow(
         llm=llm,
         github_token=github_token,
         github_repository=github_repository,
+        repo_map=repo_map,
         supabase=supabase,
         model_tier_map={
             "simple": settings.aider_model_simple,

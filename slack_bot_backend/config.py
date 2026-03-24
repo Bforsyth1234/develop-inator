@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Mapping
 from enum import StrEnum
@@ -66,6 +67,10 @@ class Settings(BaseModel):
     github_repository: str | None = None
     github_webhook_secret: str | None = Field(default=None, repr=False)
     github_bot_username: str = "develop-inator[bot]"
+
+    # Multi-repo routing: maps "owner/repo" → local clone path.
+    # Populated from the SLACK_BOT_REPO_MAP env var (JSON string).
+    repo_map: dict[str, str] = Field(default_factory=dict)
 
     # Cohere reranking (optional – when set, hybrid search results are
     # reranked with the Cohere Rerank API before being returned).
@@ -138,6 +143,7 @@ class Settings(BaseModel):
             "git_provider": source.get("SLACK_BOT_GIT_PROVIDER"),
             "github_token": source.get("SLACK_BOT_GITHUB_TOKEN"),
             "github_repository": source.get("SLACK_BOT_GITHUB_REPOSITORY"),
+            "repo_map": cls._parse_repo_map(source.get("SLACK_BOT_REPO_MAP")),
             "github_webhook_secret": source.get("SLACK_BOT_GITHUB_WEBHOOK_SECRET"),
             "github_bot_username": source.get("SLACK_BOT_GITHUB_BOT_USERNAME"),
             "redis_url": source.get("SLACK_BOT_REDIS_URL"),
@@ -147,6 +153,23 @@ class Settings(BaseModel):
         }
         values = {key: value for key, value in raw_values.items() if value is not None}
         return cls.model_validate(values)
+
+    @staticmethod
+    def _parse_repo_map(raw: str | None) -> dict[str, str] | None:
+        """Parse a JSON string like '{"owner/repo": "/tmp/repo"}' into a dict.
+
+        Returns ``None`` when the env var is absent so that the Pydantic
+        default (empty dict) is used instead.
+        """
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return {str(k): str(v) for k, v in parsed.items()}
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return None
 
 
 @lru_cache(maxsize=1)

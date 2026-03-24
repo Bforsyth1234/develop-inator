@@ -48,7 +48,7 @@ class FakeGitService:
         self.pr_calls: list[PullRequestDraft] = []
         self.resolved_threads: list[tuple[str, str]] = []
 
-    async def create_pull_request(self, draft: PullRequestDraft) -> str:
+    async def create_pull_request(self, draft: PullRequestDraft, *, repository: str | None = None) -> str:
         self.pr_calls.append(draft)
         if self.fail:
             raise RuntimeError("GitHub unavailable")
@@ -91,14 +91,17 @@ class FakeSupabaseRepository:
         fail_save: bool = False,
         pr_mapping: ActivePullRequestRecord | None = None,
         stored_execution: ActionExecution | None = None,
+        thread_context: dict[tuple[str, str], str] | None = None,
     ) -> None:
         self._stored_config = stored_config
         self._fail_save = fail_save
         self._pr_mapping = pr_mapping
         self._stored_execution = stored_execution
+        self._thread_contexts: dict[tuple[str, str], str] = dict(thread_context or {})
         self.save_calls: list[dict[str, str]] = []
         self.pr_mapping_saves: list[ActivePullRequestRecord] = []
         self.execution_status_updates: list[tuple[str, ActionExecutionStatus]] = []
+        self.thread_context_upserts: list[dict[str, str]] = []
 
     async def healthcheck(self) -> bool:
         return True
@@ -155,6 +158,23 @@ class FakeSupabaseRepository:
         ):
             return self._pr_mapping
         return None
+
+    # -- Thread context (thread memory) --
+
+    async def get_thread_context(
+        self, *, channel_id: str, thread_ts: str
+    ) -> str | None:
+        return self._thread_contexts.get((channel_id, thread_ts))
+
+    async def upsert_thread_context(
+        self, *, channel_id: str, thread_ts: str, target_repository: str
+    ) -> None:
+        self._thread_contexts[(channel_id, thread_ts)] = target_repository
+        self.thread_context_upserts.append({
+            "channel_id": channel_id,
+            "thread_ts": thread_ts,
+            "target_repository": target_repository,
+        })
 
 
 class FakeActionWorkflow:

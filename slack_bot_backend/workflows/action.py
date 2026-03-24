@@ -46,10 +46,11 @@ You are a pre-flight evaluator and model router for an AI coding assistant \
 (Aider) that modifies a repository. Aider has FULL access to the \
 codebase and can explore files, find variables, locate components, etc.
 
-You have TWO jobs:
+You have THREE jobs:
   1. Decide whether the developer's request is clear enough for Aider to \
 act on. Lean STRONGLY toward "actionable" — Aider is smart and can explore.
   2. If actionable, classify its COMPLEXITY so the system picks the right LLM.
+  3. Identify which TARGET REPOSITORY the request is about.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ACTIONABILITY — DEFAULT TO ACTIONABLE. A request is actionable when the \
@@ -87,13 +88,32 @@ tweaks that likely touch 1-2 files.
 API integrations, routing changes, or anything spanning 3+ files.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TARGET REPOSITORY — the system manages multiple repositories. You must \
+identify which repository the user's request targets. The available \
+repositories are:
+
+{available_repos}
+
+ACTIVE THREAD REPOSITORY: {active_repo}
+
+If the user's request does NOT explicitly mention or imply a specific \
+repository, you MUST default to the Active Thread Repository shown above \
+(unless it says "none").
+
+Pick EXACTLY one key from the list above and include it as \
+"target_repository" in your JSON output. If the request does not clearly \
+indicate a repository AND no Active Thread Repository is set, set \
+"target_repository" to null.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 OUTPUT FORMAT — respond with ONLY a JSON object, no markdown fences:
 
 {{
   "is_actionable": <true | false>,
   "clarifying_question": "<one focused question>" | null,
   "optimized_prompt": "<rewritten prompt>" | null,
-  "complexity_tier": "simple" | "complex"
+  "complexity_tier": "simple" | "complex",
+  "target_repository": "<repo key from list above>" | null
 }}
 
 Rules:
@@ -139,7 +159,7 @@ Developer's request:
 class ActionGitOperations(Protocol):
     """Minimal git interface required by the action workflow."""
 
-    async def create_pull_request(self, draft: PullRequestDraft) -> str: ...
+    async def create_pull_request(self, draft: PullRequestDraft, *, repository: str | None = None) -> str: ...
 
 
 class ActionWorkflow:
@@ -151,6 +171,7 @@ class ActionWorkflow:
         llm: LanguageModel,
         github_token: str = "",
         github_repository: str = "",
+        repo_map: dict[str, str] | None = None,
         supabase: SupabaseRepository | None = None,
         model_tier_map: dict[str, str] | None = None,
         aider_bin: str | None = None,
@@ -160,6 +181,7 @@ class ActionWorkflow:
         self.llm = llm
         self.github_token = github_token
         self.github_repository = github_repository
+        self.repo_map: dict[str, str] = dict(repo_map or {})
         self.supabase = supabase
         self.model_tier_map: dict[str, str] = dict(model_tier_map or _MODEL_TIER_MAP)
         self.aider_bin = aider_bin
@@ -178,11 +200,84 @@ class ActionWorkflow:
     # Public entry point
     # ------------------------------------------------------------------
 
+    def _resolve_target_repository(self, eval_result: EvaluationResult) -> str | None:
+        """Return the repo key if it exists in ``repo_map``, else ``None``."""
+        target = eval_result.target_repository
+        if target and target in self.repo_map:
+            return target
+        return None
+
+    async def _get_active_thread_repo(self, request: ActionRequest) -> str | None:
+        """Fetch the remembered target repository for this thread, if any."""
+        if self.supabase is None:
+            return None
+        try:
+            return await self.supabase.get_thread_context(
+                channel_id=request.channel,
+                thread_ts=request.thread_ts,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to read thread context; continuing without it",
+                extra={"channel": request.channel, "thread_ts": request.thread_ts},
+                exc_info=True,
+            )
+            return None
+
+    async def _save_thread_context(self, request: ActionRequest, target_repository: str) -> None:
+        """Persist the resolved target repository for future messages in this thread."""
+        if self.supabase is None:
+            return
+        try:
+            await self.supabase.upsert_thread_context(
+                channel_id=request.channel,
+                thread_ts=request.thread_ts,
+                target_repository=target_repository,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to save thread context; thread memory will not be available",
+                extra={
+                    "channel": request.channel,
+                    "thread_ts": request.thread_ts,
+                    "target_repository": target_repository,
+                },
+                exc_info=True,
+            )
+
     async def run(self, request: ActionRequest) -> ActionRouteResult:
         try:
-            eval_result = await self._evaluate_request(request)
+            # ── Pre-flight: fetch remembered thread context ──
+            active_thread_repo = await self._get_active_thread_repo(request)
+
+            eval_result = await self._evaluate_request(
+                request, active_thread_repo=active_thread_repo,
+            )
             if not eval_result.is_actionable:
                 return await self._handle_needs_clarification(request, eval_result)
+
+            # ── Resolve target repository ──
+            target_repo_key: str | None = None
+            if self.repo_map:
+                target_repo_key = self._resolve_target_repository(eval_result)
+                if target_repo_key is None:
+                    # LLM didn't pick a valid repo — ask the user
+                    repo_list = ", ".join(f"`{k}`" for k in self.repo_map)
+                    message = (
+                        ":thinking_face: I couldn't determine which repository "
+                        "this change targets. The available repositories are: "
+                        f"{repo_list}. Could you clarify which one you mean?"
+                    )
+                    await self._post_message(request, message)
+                    return ActionRouteResult(
+                        status="needs_clarification",
+                        provider="evaluator",
+                        message=message,
+                    )
+
+            # ── Persist thread context for future messages ──
+            if target_repo_key is not None:
+                await self._save_thread_context(request, target_repo_key)
 
             optimized_prompt = eval_result.optimized_prompt or request.request
             selected_model = self.model_tier_map.get(
@@ -198,13 +293,18 @@ class ActionWorkflow:
 
             # ── Simple task → run Aider directly ──
             aider_result = await self._run_aider(
-                request, optimized_prompt=optimized_prompt, model=selected_model,
+                request,
+                optimized_prompt=optimized_prompt,
+                model=selected_model,
+                target_repo_key=target_repo_key,
             )
             if aider_result.returncode != 0:
                 if aider_result.test_attempts > 0:
                     return await self._handle_test_failure(request, aider_result)
                 return await self._handle_failure(request, aider_result)
-            return await self._handle_success(request, aider_result, model=selected_model)
+            return await self._handle_success(
+                request, aider_result, model=selected_model, target_repo_key=target_repo_key,
+            )
         except Exception:
             logger.exception(
                 "ACTION workflow encountered an unexpected error",
@@ -365,9 +465,18 @@ class ActionWorkflow:
     # Pre-flight evaluator
     # ------------------------------------------------------------------
 
-    async def _evaluate_request(self, request: ActionRequest) -> EvaluationResult:
+    async def _evaluate_request(
+        self, request: ActionRequest, *, active_thread_repo: str | None = None,
+    ) -> EvaluationResult:
         """Call the fast evaluator LLM; fail open (treat as actionable) on any error."""
-        prompt = _EVALUATOR_SYSTEM_PROMPT.format(user_request=request.request)
+        repo_keys = list(self.repo_map.keys())
+        available_repos = "\n".join(f"  • {k}" for k in repo_keys) if repo_keys else "  (none configured)"
+        active_repo_display = active_thread_repo if active_thread_repo else "none"
+        prompt = _EVALUATOR_SYSTEM_PROMPT.format(
+            user_request=request.request,
+            available_repos=available_repos,
+            active_repo=active_repo_display,
+        )
         try:
             llm_result = await self.llm.generate(prompt)
             parsed = self._parse_evaluation(llm_result.content)
@@ -665,9 +774,14 @@ class ActionWorkflow:
                 stderr=f"[bot] Test command timed out after {self._TEST_TIMEOUT}s",
             )
 
-    def _build_clone_url(self) -> str:
-        """Build a GitHub clone URL using the ``x-access-token`` scheme."""
-        if not self.github_repository:
+    def _build_clone_url(self, repository: str | None = None) -> str:
+        """Build a GitHub clone URL using the ``x-access-token`` scheme.
+
+        *repository* overrides ``self.github_repository`` when provided (used
+        for dynamic multi-repo routing).
+        """
+        resolved = repository or self.github_repository
+        if not resolved:
             raise RuntimeError(
                 "github_repository is not set. Configure it via /configure or the "
                 "SLACK_BOT_GITHUB_REPOSITORY environment variable."
@@ -676,7 +790,7 @@ class ActionWorkflow:
             raise RuntimeError(
                 "github_token is not set. Set SLACK_BOT_GITHUB_TOKEN."
             )
-        return f"https://x-access-token:{self.github_token}@github.com/{self.github_repository}.git"
+        return f"https://x-access-token:{self.github_token}@github.com/{resolved}.git"
 
     async def _run_aider(
         self,
@@ -685,8 +799,9 @@ class ActionWorkflow:
         optimized_prompt: str,
         model: str,
         existing_branch: str | None = None,
+        target_repo_key: str | None = None,
     ) -> AiderResult:
-        clone_url = self._build_clone_url()
+        clone_url = self._build_clone_url(repository=target_repo_key)
         subprocess_env = self._build_subprocess_env()
 
         # ── Workspace isolation: every Aider run happens in an ephemeral
@@ -961,7 +1076,12 @@ class ActionWorkflow:
     # ------------------------------------------------------------------
 
     async def _handle_success(
-        self, request: ActionRequest, aider_result: AiderResult, *, model: str = "",
+        self,
+        request: ActionRequest,
+        aider_result: AiderResult,
+        *,
+        model: str = "",
+        target_repo_key: str | None = None,
     ) -> ActionRouteResult:
         branch_name = aider_result.branch_name
         pr_url = await self.git.create_pull_request(
@@ -969,7 +1089,8 @@ class ActionWorkflow:
                 title=f"AI Update: {request.request[:72]}",
                 body=self._build_pr_body(request, aider_result),
                 branch_name=branch_name,
-            )
+            ),
+            repository=target_repo_key,
         )
 
         # Persist the PR → Slack thread mapping so we can handle PR comments
@@ -981,7 +1102,7 @@ class ActionWorkflow:
         )
 
         # Persist the repo config so the bot remembers the last repo it worked with
-        await self._save_repository_config()
+        await self._save_repository_config(repository=target_repo_key)
 
         model_info = f"\n_Model: `{model}`_" if model else ""
         message = (
@@ -1089,13 +1210,14 @@ class ActionWorkflow:
             return text.replace(self.github_token, "***")
         return text
 
-    async def _save_repository_config(self) -> None:
+    async def _save_repository_config(self, *, repository: str | None = None) -> None:
         """Persist the current github_repository to Supabase."""
         if self.supabase is None:
             return
+        resolved = repository or self.github_repository
         try:
             await self.supabase.save_repository_config(
-                github_repository=self.github_repository,
+                github_repository=resolved,
             )
         except Exception:
             logger.warning(

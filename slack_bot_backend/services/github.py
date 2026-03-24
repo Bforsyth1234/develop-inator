@@ -36,8 +36,8 @@ class GitHubGitService:
             timeout=20.0,
         )
 
-    async def create_pull_request(self, draft: PullRequestDraft) -> str:
-        repository = self._require_repository(None)
+    async def create_pull_request(self, draft: PullRequestDraft, *, repository: str | None = None) -> str:
+        repository = self._require_repository(repository)
         base_branch = await self._get_default_branch(repository)
         return await self._open_pull_request(repository, draft=draft, base_branch=base_branch)
 

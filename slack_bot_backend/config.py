@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Mapping
 from enum import StrEnum
@@ -63,9 +64,12 @@ class Settings(BaseModel):
 
     git_provider: GitProvider = GitProvider.STUB
     github_token: str | None = Field(default=None, repr=False)
-    github_repository: str | None = None
     github_webhook_secret: str | None = Field(default=None, repr=False)
     github_bot_username: str = "develop-inator[bot]"
+
+    # Multi-repo routing: list of "owner/repo" identifiers the bot manages.
+    # Populated from the SLACK_BOT_REPO_MAP env var (JSON array or object).
+    repo_map: list[str] = Field(default_factory=list)
 
     # Cohere reranking (optional – when set, hybrid search results are
     # reranked with the Cohere Rerank API before being returned).
@@ -137,7 +141,7 @@ class Settings(BaseModel):
             "router_heavy_model": source.get("SLACK_BOT_ROUTER_HEAVY_MODEL"),
             "git_provider": source.get("SLACK_BOT_GIT_PROVIDER"),
             "github_token": source.get("SLACK_BOT_GITHUB_TOKEN"),
-            "github_repository": source.get("SLACK_BOT_GITHUB_REPOSITORY"),
+            "repo_map": cls._parse_repo_map(source.get("SLACK_BOT_REPO_MAP")),
             "github_webhook_secret": source.get("SLACK_BOT_GITHUB_WEBHOOK_SECRET"),
             "github_bot_username": source.get("SLACK_BOT_GITHUB_BOT_USERNAME"),
             "redis_url": source.get("SLACK_BOT_REDIS_URL"),
@@ -147,6 +151,30 @@ class Settings(BaseModel):
         }
         values = {key: value for key, value in raw_values.items() if value is not None}
         return cls.model_validate(values)
+
+    @staticmethod
+    def _parse_repo_map(raw: str | None) -> list[str] | None:
+        """Parse a JSON string into a list of ``owner/repo`` identifiers.
+
+        Accepts either a JSON array (``["owner/repo"]``) or a JSON object
+        (``{"owner/repo": "..."}``).  When an object is supplied the keys
+        are extracted and the values are discarded — this preserves backward
+        compatibility with earlier configs that mapped repos to local paths.
+
+        Returns ``None`` when the env var is absent so that the Pydantic
+        default (empty list) is used instead.
+        """
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [str(item) for item in parsed]
+            if isinstance(parsed, dict):
+                return [str(k) for k in parsed]
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return None
 
 
 @lru_cache(maxsize=1)

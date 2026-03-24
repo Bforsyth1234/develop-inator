@@ -80,6 +80,7 @@ class EvaluationResult(BaseModel):
     clarifying_question: str | None = None
     optimized_prompt: str | None = None
     complexity_tier: Literal["simple", "complex"] = "simple"
+    target_repository: str | None = None
 
 
 class ActionExecution(BaseModel):

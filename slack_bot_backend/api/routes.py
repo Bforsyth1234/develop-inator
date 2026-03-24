@@ -169,6 +169,15 @@ async def handle_github_webhook(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON payload"
         ) from exc
 
+    # ── Filter: only process events from repositories in our repo_map ──
+    repo_full_name = payload.get("repository", {}).get("full_name")
+    if repo_full_name and repo_full_name not in container.settings.repo_map:
+        logger.debug(
+            "Ignoring webhook from unmanaged repository",
+            extra={"repo_full_name": repo_full_name},
+        )
+        return {"ok": True, "message": f"ignored repo: {repo_full_name}"}
+
     # ── Handle PR comment events ──
     if event_type == "issue_comment":
         return await _handle_issue_comment(payload, container)

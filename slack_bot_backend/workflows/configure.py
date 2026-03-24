@@ -46,12 +46,11 @@ class ConfigureWorkflow:
         slack: SlackGateway,
         supabase: SupabaseRepository,
         llm: LanguageModel,
-        github_repository: str = "",
     ) -> None:
         self.slack = slack
         self.supabase = supabase
         self.llm = llm
-        self.github_repository = github_repository
+        self.github_repository: str = ""
 
     async def run(
         self, *, channel: str, thread_ts: str, user_message: str, user_id: str | None = None,

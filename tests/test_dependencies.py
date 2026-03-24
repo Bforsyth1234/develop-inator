@@ -1,6 +1,5 @@
 import unittest
 from types import SimpleNamespace
-from unittest import mock
 
 from slack_bot_backend.config import Settings
 from slack_bot_backend.dependencies import ServiceContainer, build_service_container, get_container
@@ -10,7 +9,7 @@ from slack_bot_backend.services.stubs import (
     StubSlackGateway,
     StubSupabaseRepository,
 )
-from slack_bot_backend.services.supabase_persistence import RepositoryConfig, SupabasePersistenceRepository
+from slack_bot_backend.services.supabase_persistence import SupabasePersistenceRepository
 from slack_bot_backend.workflows import ActionWorkflow, IntentWorkflow, QuestionWorkflow
 
 
@@ -73,84 +72,15 @@ class DependencyTests(unittest.TestCase):
         self.assertIs(container.intent.supabase, container.supabase)
         self.assertIs(container.question.supabase, container.supabase)
 
-    def test_build_service_container_overrides_repo_config_from_supabase(self) -> None:
+    def test_build_service_container_passes_repo_map_to_action_workflow(self) -> None:
         settings = Settings(
             environment="testing",
-            supabase_enabled=True,
-            supabase_url="https://example.supabase.co",
-            supabase_service_role_key="service-role-key",
-            github_repository="env/default-repo",
-        )
-        stored_config = RepositoryConfig(
-            github_repository="supabase/override-repo",
+            repo_map=["owner/repo"],
         )
 
-        with mock.patch.object(
-            SupabasePersistenceRepository,
-            "get_repository_config",
-            return_value=stored_config,
-        ):
-            container = build_service_container(settings)
+        container = build_service_container(settings)
 
-        self.assertEqual(container.action.github_repository, "supabase/override-repo")
-
-    def test_build_service_container_uses_env_defaults_when_supabase_returns_none(self) -> None:
-        settings = Settings(
-            environment="testing",
-            supabase_enabled=True,
-            supabase_url="https://example.supabase.co",
-            supabase_service_role_key="service-role-key",
-            github_repository="env/repo",
-        )
-
-        with mock.patch.object(
-            SupabasePersistenceRepository,
-            "get_repository_config",
-            return_value=None,
-        ):
-            container = build_service_container(settings)
-
-        self.assertEqual(container.action.github_repository, "env/repo")
-
-    def test_build_service_container_uses_env_defaults_when_supabase_fetch_fails(self) -> None:
-        settings = Settings(
-            environment="testing",
-            supabase_enabled=True,
-            supabase_url="https://example.supabase.co",
-            supabase_service_role_key="service-role-key",
-            github_repository="env/fallback-repo",
-        )
-
-        with mock.patch.object(
-            SupabasePersistenceRepository,
-            "get_repository_config",
-            side_effect=RuntimeError("Supabase down"),
-        ):
-            container = build_service_container(settings)
-
-        self.assertEqual(container.action.github_repository, "env/fallback-repo")
-
-    def test_build_service_container_partial_override_from_supabase(self) -> None:
-        """github_repository empty in Supabase → falls back to env."""
-        settings = Settings(
-            environment="testing",
-            supabase_enabled=True,
-            supabase_url="https://example.supabase.co",
-            supabase_service_role_key="service-role-key",
-            github_repository="env/repo",
-        )
-        stored_config = RepositoryConfig(
-            github_repository="",  # empty → fall back to env
-        )
-
-        with mock.patch.object(
-            SupabasePersistenceRepository,
-            "get_repository_config",
-            return_value=stored_config,
-        ):
-            container = build_service_container(settings)
-
-        self.assertEqual(container.action.github_repository, "env/repo")
+        self.assertEqual(container.action.repo_map, ["owner/repo"])
 
 
 if __name__ == "__main__":

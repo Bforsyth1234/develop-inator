@@ -642,6 +642,73 @@ class ActionExecutionRepository:
         )
 
 
+class ThreadContextRepository:
+    """Read/write the ``slack_thread_contexts`` table for thread memory."""
+
+    _TABLE = "rest/v1/slack_thread_contexts"
+
+    def __init__(self, transport: AsyncSupabaseTransport) -> None:
+        self._transport = transport
+
+    async def get_thread_context(
+        self, *, channel_id: str, thread_ts: str
+    ) -> str | None:
+        """Return the ``target_repository`` for a thread, or *None*."""
+        try:
+            response = await self._transport.request(
+                "GET",
+                self._TABLE,
+                query={
+                    "select": "target_repository",
+                    "channel_id": f"eq.{channel_id}",
+                    "thread_ts": f"eq.{thread_ts}",
+                    "limit": "1",
+                },
+            )
+        except SupabasePersistenceError as exc:
+            logger.warning(
+                "Failed to load thread context from Supabase",
+                extra=exc.to_dict(),
+            )
+            return None
+
+        rows = response.data
+        if not isinstance(rows, list) or len(rows) == 0:
+            return None
+        row = _expect_mapping(rows[0], "slack_thread_contexts row")
+        return _string_or_none(row.get("target_repository"))
+
+    async def upsert_thread_context(
+        self, *, channel_id: str, thread_ts: str, target_repository: str
+    ) -> None:
+        """Insert or update the target repository for a thread."""
+        payload: dict[str, JSONValue] = {
+            "channel_id": channel_id,
+            "thread_ts": thread_ts,
+            "target_repository": target_repository,
+            "updated_at": datetime.now().isoformat(),
+        }
+        try:
+            await self._transport.request(
+                "POST",
+                self._TABLE,
+                json_body=payload,
+                headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+            )
+        except SupabasePersistenceError as exc:
+            logger.exception(
+                "Failed to upsert thread context in Supabase",
+                extra=exc.to_dict(),
+            )
+            raise SupabasePersistenceError(
+                "upsert_thread_context",
+                "slack_thread_contexts",
+                "Could not persist thread context",
+                details=exc.to_dict(),
+                status_code=exc.status_code,
+            ) from exc
+
+
 class SupabasePersistenceRepository:
     def __init__(self, transport: AsyncSupabaseTransport) -> None:
         self._transport = transport
@@ -650,6 +717,7 @@ class SupabasePersistenceRepository:
         self._repo_config = RepositoryConfigRepository(transport)
         self._action_executions = ActionExecutionRepository(transport)
         self._pull_requests = PullRequestRepository(transport)
+        self._thread_contexts = ThreadContextRepository(transport)
 
     async def healthcheck(self) -> bool:
         try:
@@ -736,6 +804,24 @@ class SupabasePersistenceRepository:
     ) -> ActivePullRequestRecord | None:
         return await self._pull_requests.get_pr_mapping_by_thread(
             channel_id=channel_id, thread_ts=thread_ts
+        )
+
+    # -- Thread context (thread memory) --
+
+    async def get_thread_context(
+        self, *, channel_id: str, thread_ts: str
+    ) -> str | None:
+        return await self._thread_contexts.get_thread_context(
+            channel_id=channel_id, thread_ts=thread_ts,
+        )
+
+    async def upsert_thread_context(
+        self, *, channel_id: str, thread_ts: str, target_repository: str
+    ) -> None:
+        await self._thread_contexts.upsert_thread_context(
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            target_repository=target_repository,
         )
 
 

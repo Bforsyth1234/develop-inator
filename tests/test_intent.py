@@ -268,7 +268,6 @@ class IntentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
         configure = ConfigureWorkflow(
             slack=slack, supabase=supabase, llm=llm,
-            github_repository="org/old-repo",
         )
         workflow = IntentWorkflow(
             slack=slack, supabase=supabase, llm=llm, configure=configure,
@@ -330,7 +329,6 @@ class IntentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
         configure = ConfigureWorkflow(
             slack=slack, supabase=supabase, llm=llm,
-            github_repository="org/old",
         )
         workflow = IntentWorkflow(
             slack=slack, supabase=supabase, llm=llm, configure=configure,

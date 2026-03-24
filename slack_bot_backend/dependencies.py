@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -43,45 +42,14 @@ def build_service_container(settings: Settings) -> ServiceContainer:
     supabase = _build_supabase_repository(settings)
     llm = _build_language_model(settings)
 
-    # Load dynamic repo config from Supabase, falling back to env values
-    github_repository = settings.github_repository or ""
-    if isinstance(supabase, SupabasePersistenceRepository):
-        try:
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-
-            if loop and loop.is_running():
-                # We're inside an async context already; create a new loop in a thread
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    config = pool.submit(
-                        asyncio.run, supabase.get_repository_config()
-                    ).result()
-            else:
-                config = asyncio.run(supabase.get_repository_config())
-            if config is not None:
-                if config.github_repository:
-                    github_repository = config.github_repository
-                    logger.info(
-                        "Loaded github_repository from Supabase: %s",
-                        github_repository,
-                    )
-        except Exception:
-            logger.warning(
-                "Could not load repository config from Supabase; using env defaults",
-                exc_info=True,
-            )
-
-    git = _build_git_service(settings, github_repository=github_repository)
+    git = _build_git_service(settings)
     action = _build_action_workflow(
         slack=slack,
         git=git,
         llm=llm,
         supabase=supabase,
         github_token=settings.github_token or "",
-        github_repository=github_repository,
+        repo_map=settings.repo_map,
         settings=settings,
     )
     question = QuestionWorkflow(
@@ -94,7 +62,6 @@ def build_service_container(settings: Settings) -> ServiceContainer:
         slack=slack,
         supabase=supabase,
         llm=llm,
-        github_repository=github_repository,
     )
     indexer = _build_indexer(settings)
     return ServiceContainer(
@@ -242,15 +209,13 @@ def _build_model_from_spec(settings: Settings, spec: str) -> LanguageModel:
     )
 
 
-def _build_git_service(
-    settings: Settings, *, github_repository: str = ""
-) -> GitService:
+def _build_git_service(settings: Settings) -> GitService:
     if settings.git_provider is GitProvider.GITHUB:
         from .services.github import GitHubGitService
 
         return GitHubGitService(
             token=settings.github_token or "",
-            repository=github_repository or settings.github_repository,
+            repository=None,
         )
     return StubGitService()
 
@@ -262,7 +227,7 @@ def _build_action_workflow(
     llm: LanguageModel,
     supabase: SupabaseRepository,
     github_token: str,
-    github_repository: str,
+    repo_map: list[str] | None = None,
     settings: Settings,
 ) -> ActionWorkflow:
     from .workflows.action import ActionWorkflow
@@ -272,7 +237,7 @@ def _build_action_workflow(
         git=git,
         llm=llm,
         github_token=github_token,
-        github_repository=github_repository,
+        repo_map=repo_map,
         supabase=supabase,
         model_tier_map={
             "simple": settings.aider_model_simple,
@@ -284,13 +249,15 @@ def _build_action_workflow(
 def _build_indexer(
     settings: Settings,
 ) -> CodebaseIndexer | None:
+    # The indexer requires at least one repository in the repo_map.
+    first_repo = next(iter(settings.repo_map), None) if settings.repo_map else None
     if (
         not settings.supabase_enabled
         or not settings.supabase_url
         or not settings.supabase_service_role_key
         or not settings.openai_api_key
         or not settings.github_token
-        or not settings.github_repository
+        or not first_repo
     ):
         return None
     transport = UrllibSupabaseTransport(
@@ -301,7 +268,7 @@ def _build_indexer(
         openai_api_key=settings.openai_api_key,
         transport=transport,
         github_token=settings.github_token,
-        github_repository=settings.github_repository,
+        github_repository=first_repo,
     )
 
 

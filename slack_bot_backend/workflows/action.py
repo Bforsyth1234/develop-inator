@@ -477,6 +477,10 @@ class ActionWorkflow:
         thread_ts = mapping.thread_ts
         branch_name = mapping.branch_name
 
+        # Extract "owner/repo" from the PR URL so we can clone the right repo.
+        # PR URLs look like https://github.com/owner/repo/pull/123
+        target_repo_key = self._repo_key_from_pr_url(pr_url)
+
         # 2. Notify Slack thread
         comment_excerpt = comment_body[:200] + ("…" if len(comment_body) > 200 else "")
         try:
@@ -538,6 +542,7 @@ class ActionWorkflow:
                     optimized_prompt=optimized_prompt,
                     model=selected_model,
                     existing_branch=branch_name,
+                    target_repo_key=target_repo_key,
                 )
             except Exception:
                 logger.exception("Aider run failed for PR comment feedback")
@@ -961,6 +966,22 @@ class ActionWorkflow:
                 stdout="",
                 stderr=f"[bot] Test command timed out after {self._TEST_TIMEOUT}s",
             )
+
+    @staticmethod
+    def _repo_key_from_pr_url(pr_url: str) -> str | None:
+        """Extract ``owner/repo`` from a GitHub PR URL.
+
+        Expected format: ``https://github.com/owner/repo/pull/123``
+        Returns ``None`` if the URL doesn't match the expected pattern.
+        """
+        # e.g. ['', 'owner', 'repo', 'pull', '123']
+        parts = pr_url.rstrip("/").split("github.com/")
+        if len(parts) < 2:
+            return None
+        segments = parts[1].split("/")
+        if len(segments) >= 2:
+            return f"{segments[0]}/{segments[1]}"
+        return None
 
     def _build_clone_url(self, repository: str) -> str:
         """Build a GitHub clone URL using the ``x-access-token`` scheme.

@@ -1409,5 +1409,120 @@ class SubprocessTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("timed out", result.stderr)
 
 
+class TestRepoKeyFromPrUrl(unittest.TestCase):
+    """Unit tests for ActionWorkflow._repo_key_from_pr_url."""
+
+    def test_standard_pr_url(self) -> None:
+        result = ActionWorkflow._repo_key_from_pr_url(
+            "https://github.com/Bforsyth1234/develop-inator/pull/42"
+        )
+        self.assertEqual(result, "Bforsyth1234/develop-inator")
+
+    def test_pr_url_with_trailing_slash(self) -> None:
+        result = ActionWorkflow._repo_key_from_pr_url(
+            "https://github.com/owner/repo/pull/99/"
+        )
+        self.assertEqual(result, "owner/repo")
+
+    def test_non_pr_github_url(self) -> None:
+        result = ActionWorkflow._repo_key_from_pr_url(
+            "https://github.com/owner/repo/issues/5"
+        )
+        self.assertEqual(result, "owner/repo")
+
+    def test_non_github_url_returns_none(self) -> None:
+        result = ActionWorkflow._repo_key_from_pr_url("https://example.com/foo/bar")
+        self.assertIsNone(result)
+
+    def test_empty_string_returns_none(self) -> None:
+        result = ActionWorkflow._repo_key_from_pr_url("")
+        self.assertIsNone(result)
+
+    def test_only_owner_returns_none(self) -> None:
+        result = ActionWorkflow._repo_key_from_pr_url("https://github.com/owner")
+        self.assertIsNone(result)
+
+
+class TestHandlePrCommentPassesTargetRepo(unittest.IsolatedAsyncioTestCase):
+    """Verify handle_pr_comment resolves and passes target_repo_key to _run_aider."""
+
+    def setUp(self) -> None:
+        # Disable test detection
+        patcher = mock.patch.object(
+            ActionWorkflow, "_detect_test_command", return_value=None,
+        )
+        self._no_tests = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def test_handle_pr_comment_passes_target_repo_key(self) -> None:
+        pr_url = "https://github.com/acme/widgets/pull/7"
+        slack = FakeSlackGateway()
+        git = FakeGitService()
+        supabase = FakeSupabaseRepository(
+            pr_mapping=ActivePullRequestRecord(
+                pr_url=pr_url,
+                branch_name="ai-update-123",
+                channel_id="C999",
+                thread_ts="111.222",
+            ),
+        )
+        llm = FakeLanguageModel()
+
+        workflow = ActionWorkflow(
+            slack=slack,
+            git=git,
+            llm=llm,
+            github_token="stub",
+            model_tier_map=_DEFAULT_TIER_MAP,
+            supabase=supabase,
+            repo_map=["acme/widgets"],
+        )
+
+        captured_kwargs: dict = {}
+
+        async def fake_run_aider(request, **kwargs):
+            captured_kwargs.update(kwargs)
+            return AiderResult(
+                branch_name="ai-update-123",
+                stdout="ok",
+                stderr="",
+                returncode=0,
+            )
+
+        with mock.patch.object(workflow, "_run_aider", side_effect=fake_run_aider):
+            await workflow.handle_pr_comment(
+                pr_url=pr_url,
+                comment_body="Please fix the typo",
+                sender="reviewer",
+            )
+
+        self.assertEqual(captured_kwargs.get("target_repo_key"), "acme/widgets")
+        self.assertEqual(captured_kwargs.get("existing_branch"), "ai-update-123")
+
+    async def test_handle_pr_comment_no_mapping_is_noop(self) -> None:
+        """When no PR mapping exists, handle_pr_comment should return early."""
+        slack = FakeSlackGateway()
+        git = FakeGitService()
+        supabase = FakeSupabaseRepository()  # no pr_mapping
+
+        workflow = ActionWorkflow(
+            slack=slack,
+            git=git,
+            llm=FakeLanguageModel(),
+            github_token="stub",
+            model_tier_map=_DEFAULT_TIER_MAP,
+            supabase=supabase,
+        )
+
+        await workflow.handle_pr_comment(
+            pr_url="https://github.com/acme/widgets/pull/99",
+            comment_body="Fix it",
+            sender="someone",
+        )
+
+        # No Slack messages should be posted
+        self.assertEqual(len(slack.messages), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

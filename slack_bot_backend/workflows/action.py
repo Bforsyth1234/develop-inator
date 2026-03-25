@@ -22,7 +22,7 @@ from slack_bot_backend.models.action import (
     EvaluationResult,
 )
 from slack_bot_backend.models.persistence import ActivePullRequestRecord
-from slack_bot_backend.services.interfaces import LanguageModel, PullRequestDraft, SlackGateway, SupabaseRepository
+from slack_bot_backend.services.interfaces import ContextSearch, LanguageModel, PullRequestDraft, SlackGateway, SupabaseRepository
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +174,7 @@ class ActionWorkflow:
         supabase: SupabaseRepository | None = None,
         model_tier_map: dict[str, str] | None = None,
         aider_bin: str | None = None,
+        context_search: ContextSearch | None = None,
     ) -> None:
         self.slack = slack
         self.git = git
@@ -183,6 +184,7 @@ class ActionWorkflow:
         self.supabase = supabase
         self.model_tier_map: dict[str, str] = dict(model_tier_map or _MODEL_TIER_MAP)
         self.aider_bin = aider_bin
+        self.context_search = context_search
         # Per-branch locks to serialize concurrent Aider runs.
         # When multiple review comments arrive at the same time for the
         # same branch, only one Aider process runs at a time; the rest queue.
@@ -857,11 +859,69 @@ class ActionWorkflow:
 
     _MAX_TEST_ATTEMPTS = 3
 
+    def _detect_install_command(self, work_dir: str | None = None) -> list[str] | None:
+        """Detect the dependency-install command for the repository."""
+        repo = Path(work_dir or os.getcwd())
+        if (repo / "pnpm-lock.yaml").exists():
+            return ["pnpm", "install", "--frozen-lockfile"]
+        if (repo / "yarn.lock").exists():
+            return ["yarn", "install", "--frozen-lockfile"]
+        if (repo / "package-lock.json").exists() or (repo / "package.json").exists():
+            return ["npm", "ci"]
+        if (repo / "requirements.txt").exists():
+            return ["pip", "install", "-r", "requirements.txt"]
+        return None
+
+    _INSTALL_TIMEOUT = 300  # 5 minutes
+
+    async def _install_dependencies(
+        self, env: dict[str, str], *, cwd: str | None = None,
+    ) -> subprocess.CompletedProcess[str] | None:
+        """Install project dependencies if a known package manager is detected.
+
+        Returns the completed process, or *None* if no install command was detected.
+        """
+        work_dir = cwd or os.getcwd()
+        install_cmd = self._detect_install_command(work_dir)
+        if install_cmd is None:
+            return None
+        logger.info("Installing dependencies: %s (cwd=%s)", install_cmd, work_dir)
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                install_cmd,
+                capture_output=True,
+                text=True,
+                cwd=work_dir,
+                env=env,
+                timeout=self._INSTALL_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            logger.error("Dependency install timed out after %ds: %s", self._INSTALL_TIMEOUT, install_cmd)
+            return subprocess.CompletedProcess(
+                args=install_cmd,
+                returncode=1,
+                stdout="",
+                stderr=f"[bot] Dependency install timed out after {self._INSTALL_TIMEOUT}s",
+            )
+        if result.returncode != 0:
+            logger.warning(
+                "Dependency install failed (exit %d): %s",
+                result.returncode, result.stderr[-500:],
+            )
+        else:
+            logger.info("Dependencies installed successfully")
+        return result
+
     def _detect_test_command(self, work_dir: str | None = None) -> list[str] | None:
         """Detect the test command for the repository. Returns None if unknown."""
         repo = Path(work_dir or os.getcwd())
-        # Node / npm projects
+        # Node / npm projects — prefer the lockfile-specific runner
         if (repo / "package.json").exists():
+            if (repo / "pnpm-lock.yaml").exists():
+                return ["pnpm", "test"]
+            if (repo / "yarn.lock").exists():
+                return ["yarn", "test"]
             return ["npm", "test"]
         # Python / pytest projects
         if (repo / "pytest.ini").exists():
@@ -1015,7 +1075,34 @@ class ActionWorkflow:
                     returncode=checkout_proc.returncode,
                 )
 
-        # 2. Run Aider non-interactively with the routed model
+        # 2. Discover relevant files via context search (OpenViking)
+        file_args: list[str] = []
+        if self.context_search is not None:
+            try:
+                matches = await self.context_search.match_chunks(
+                    [],
+                    query_text=optimized_prompt,
+                    limit=8,
+                )
+                for m in matches:
+                    # Extract relative file path from the URI or path field
+                    raw = m.path or ""
+                    # viking://resources/owner/repo/path/to/file → path/to/file
+                    parts = raw.split("/", 5)  # ['viking:', '', 'resources', 'owner', 'repo', 'rest']
+                    rel = parts[5] if len(parts) > 5 else raw.rsplit("/", 1)[-1]
+                    if rel:
+                        full = os.path.join(work_dir, rel)
+                        if os.path.isfile(full):
+                            file_args.append(rel)
+                logger.info(
+                    "Context search found %d candidate files, %d exist on disk",
+                    len(matches),
+                    len(file_args),
+                )
+            except Exception:
+                logger.warning("Context search failed; Aider will use repo map only", exc_info=True)
+
+        # 2b. Run Aider non-interactively with the routed model
         if self.aider_bin:
             aider_bin = self.aider_bin
         else:
@@ -1025,8 +1112,10 @@ class ActionWorkflow:
             aider_bin,
             "--model", model,
             "--yes-always",
+            "--no-auto-commits",
             "--no-show-model-warnings",
             "--message", optimized_prompt,
+            *file_args,
         ]
         logger.info(
             "Launching Aider subprocess",
@@ -1063,15 +1152,21 @@ class ActionWorkflow:
             self._sanitise_output(aider_proc.stdout[-3000:]) if aider_proc.stdout else "(empty)",
             self._sanitise_output(aider_proc.stderr[-3000:]) if aider_proc.stderr else "(empty)",
         )
+        # With --no-auto-commits, Aider leaves changes uncommitted.
+        # Check for either new commits OR a dirty working tree.
         current_sha_proc = await self._git("rev-parse", "HEAD", cwd=work_dir)
         current_sha = current_sha_proc.stdout.strip()
         aider_made_commits = current_sha != base_sha
 
-        if aider_proc.returncode != 0 or not aider_made_commits:
+        # Check for uncommitted changes (staged or unstaged)
+        diff_proc = await self._git("status", "--porcelain", cwd=work_dir)
+        has_uncommitted = bool(diff_proc.stdout.strip())
+
+        if aider_proc.returncode != 0 or (not aider_made_commits and not has_uncommitted):
             reason = (
                 f"exit {aider_proc.returncode}"
                 if aider_proc.returncode != 0
-                else "no commits produced"
+                else "no changes produced"
             )
             logger.warning(
                 "Aider run unsuccessful (%s); ephemeral workspace will be cleaned up",
@@ -1082,12 +1177,24 @@ class ActionWorkflow:
                 branch_name=branch_name,
                 stdout=aider_proc.stdout,
                 stderr=aider_proc.stderr + (
-                    "\n[bot] Aider made no changes." if not aider_made_commits else ""
+                    "\n[bot] Aider made no changes." if not aider_made_commits and not has_uncommitted else ""
                 ),
                 returncode=aider_proc.returncode or 1,
             )
 
-        # 3. Run test validation loop (if a test framework is detected)
+        # Commit any uncommitted changes left by Aider (--no-auto-commits mode)
+        if has_uncommitted:
+            await self._git("add", "-A", cwd=work_dir)
+            await self._git(
+                "commit", "-m", f"feat: {optimized_prompt[:72]}",
+                cwd=work_dir,
+            )
+            logger.info("Committed Aider's uncommitted changes", extra={"branch": branch_name})
+
+        # 3. Install dependencies (so test runners like jest/pnpm are available)
+        await self._install_dependencies(subprocess_env, cwd=work_dir)
+
+        # 4. Run test validation loop (if a test framework is detected)
         test_cmd = self._detect_test_command(work_dir)
         test_attempts = 0
         last_test_output = ""

@@ -33,7 +33,7 @@ class OpenVikingContextService:
         from openviking_cli.client.http import AsyncHTTPClient
 
         self._client = AsyncHTTPClient(
-            base_url=openviking_url,
+            url=openviking_url,
             api_key=openviking_api_key or "",
         )
         self._initialized = False

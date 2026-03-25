@@ -53,6 +53,7 @@ def build_service_container(settings: Settings) -> ServiceContainer:
         github_token=settings.github_token or "",
         repo_map=settings.repo_map,
         settings=settings,
+        context_search=context_search,
     )
     question = QuestionWorkflow(
         slack=slack,
@@ -251,6 +252,7 @@ def _build_action_workflow(
     github_token: str,
     repo_map: list[str] | None = None,
     settings: Settings,
+    context_search: ContextSearch | None = None,
 ) -> ActionWorkflow:
     from .workflows.action import ActionWorkflow
 
@@ -265,6 +267,7 @@ def _build_action_workflow(
             "simple": settings.aider_model_simple,
             "complex": settings.aider_model_complex,
         },
+        context_search=context_search,
     )
 
 

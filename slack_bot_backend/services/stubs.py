@@ -11,6 +11,7 @@ from slack_bot_backend.models.persistence import ActivePullRequestRecord, Docume
 from slack_bot_backend.services.supabase_persistence import RepositoryConfig
 
 from .interfaces import (
+    ContextSearch,
     EmbeddingResult,
     GitService,
     LLMResult,
@@ -55,6 +56,28 @@ class StubSlackGateway(SlackGateway):
         )
 
 
+class StubContextSearch(ContextSearch):
+    async def match_chunks(
+        self,
+        query_embedding: tuple[float, ...],
+        *,
+        query_text: str = "",
+        limit: int = 5,
+        min_similarity: float = 0.0,
+        metadata_filter: dict[str, JSONValue] | None = None,
+    ) -> list[DocumentationMatch]:
+        logger.info(
+            "Stub context search match invoked",
+            extra={
+                "embedding_dimensions": len(query_embedding),
+                "limit": limit,
+                "min_similarity": min_similarity,
+                "metadata_filter": metadata_filter or {},
+            },
+        )
+        return []
+
+
 class StubSupabaseRepository(SupabaseRepository):
     async def healthcheck(self) -> bool:
         logger.info("Stub Supabase repository healthcheck invoked")
@@ -66,26 +89,6 @@ class StubSupabaseRepository(SupabaseRepository):
         logger.info(
             "Stub Supabase thread history lookup invoked",
             extra={"channel": channel_id, "thread_ts": thread_ts, "limit": limit},
-        )
-        return []
-
-    async def match_chunks(
-        self,
-        query_embedding: tuple[float, ...],
-        *,
-        query_text: str = "",
-        limit: int = 5,
-        min_similarity: float = 0.0,
-        metadata_filter: dict[str, JSONValue] | None = None,
-    ) -> list[DocumentationMatch]:
-        logger.info(
-            "Stub Supabase vector match invoked",
-            extra={
-                "embedding_dimensions": len(query_embedding),
-                "limit": limit,
-                "min_similarity": min_similarity,
-                "metadata_filter": metadata_filter or {},
-            },
         )
         return []
 

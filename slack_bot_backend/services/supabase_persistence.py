@@ -826,7 +826,6 @@ class SupabasePersistenceRepository:
     def __init__(self, transport: AsyncSupabaseTransport) -> None:
         self._transport = transport
         self._thread_history = SlackThreadHistoryRepository(transport)
-        self._documentation = DocumentationChunkRepository(transport)
         self._repo_config = RepositoryConfigRepository(transport)
         self._action_executions = ActionExecutionRepository(transport)
         self._pull_requests = PullRequestRepository(transport)
@@ -855,23 +854,6 @@ class SupabasePersistenceRepository:
             channel_id=channel_id,
             thread_ts=thread_ts,
             limit=limit,
-        )
-
-    async def match_chunks(
-        self,
-        query_embedding: Sequence[float],
-        *,
-        query_text: str = "",
-        limit: int = 5,
-        min_similarity: float = 0.0,
-        metadata_filter: Mapping[str, JSONValue] | None = None,
-    ) -> list[DocumentationMatch]:
-        return await self._documentation.match_chunks(
-            query_embedding,
-            query_text=query_text,
-            limit=limit,
-            min_similarity=min_similarity,
-            metadata_filter=metadata_filter,
         )
 
     async def get_repository_config(self) -> RepositoryConfig | None:

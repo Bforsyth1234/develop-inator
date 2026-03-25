@@ -38,15 +38,29 @@ class FakeSlackGateway:
         self.update_calls.append({"channel": channel, "ts": ts, "text": text, "blocks": blocks})
 
 
+class FakeContextSearch:
+    def __init__(self, *, documents: list[DocumentationMatch] | None = None) -> None:
+        self.documents = documents or []
+
+    async def match_chunks(
+        self,
+        query_embedding: tuple[float, ...],
+        *,
+        query_text: str = "",
+        limit: int = 5,
+        min_similarity: float = 0.0,
+        metadata_filter: dict[str, object] | None = None,
+    ) -> list[DocumentationMatch]:
+        return self.documents[:limit]
+
+
 class FakeSupabaseRepository:
     def __init__(
         self,
         *,
         thread_messages: list[SlackThreadMessageRecord] | None = None,
-        documents: list[DocumentationMatch] | None = None,
     ) -> None:
         self.thread_messages = thread_messages or []
-        self.documents = documents or []
         self.thread_calls: list[dict[str, str | int]] = []
         self.saved_configs: list[dict[str, str]] = []
         self._pending_requests: dict[tuple[str, str], str] = {}
@@ -59,17 +73,6 @@ class FakeSupabaseRepository:
     ) -> list[SlackThreadMessageRecord]:
         self.thread_calls.append({"channel_id": channel_id, "thread_ts": thread_ts, "limit": limit})
         return self.thread_messages[:limit]
-
-    async def match_chunks(
-        self,
-        query_embedding: tuple[float, ...],
-        *,
-        query_text: str = "",
-        limit: int = 5,
-        min_similarity: float = 0.0,
-        metadata_filter: dict[str, object] | None = None,
-    ) -> list[DocumentationMatch]:
-        return self.documents[:limit]
 
     async def get_repository_config(self):
         return None
@@ -212,6 +215,8 @@ class IntentWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     user_id="U111",
                 )
             ],
+        )
+        context_search = FakeContextSearch(
             documents=[
                 DocumentationMatch(
                     source_type="runbook",
@@ -225,7 +230,7 @@ class IntentWorkflowTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         llm = FakeLanguageModel(question_answer="Redeploy the previous stable image.")
-        question = QuestionWorkflow(slack=slack, supabase=supabase, llm=llm)
+        question = QuestionWorkflow(slack=slack, supabase=supabase, llm=llm, context_search=context_search)
         workflow = IntentWorkflow(
             slack=slack,
             supabase=supabase,

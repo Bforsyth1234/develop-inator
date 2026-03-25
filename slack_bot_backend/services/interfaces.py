@@ -9,6 +9,10 @@ from typing import TYPE_CHECKING, Protocol
 from slack_bot_backend.models.action import ActionExecution, ActionExecutionStatus, ProposedFileChange, RepositorySearchResult
 from slack_bot_backend.models.persistence import ActivePullRequestRecord, DocumentationMatch, JSONValue, SlackThreadMessageRecord
 
+# Re-export DocumentationMatch so downstream callers that imported it via
+# interfaces keep working.
+__all__ = ["DocumentationMatch"]
+
 if TYPE_CHECKING:
     from slack_bot_backend.services.supabase_persistence import RepositoryConfig
 
@@ -52,12 +56,11 @@ class SlackGateway(Protocol):
     ) -> None: ...
 
 
-class SupabaseRepository(Protocol):
-    async def healthcheck(self) -> bool: ...
+class ContextSearch(Protocol):
+    """Semantic search over documentation / codebase context.
 
-    async def get_thread_messages(
-        self, *, channel_id: str, thread_ts: str, limit: int = 50
-    ) -> list[SlackThreadMessageRecord]: ...
+    Implementations may use OpenViking, Supabase pgvector, or a stub.
+    """
 
     async def match_chunks(
         self,
@@ -68,6 +71,14 @@ class SupabaseRepository(Protocol):
         min_similarity: float = 0.0,
         metadata_filter: dict[str, JSONValue] | None = None,
     ) -> list[DocumentationMatch]: ...
+
+
+class SupabaseRepository(Protocol):
+    async def healthcheck(self) -> bool: ...
+
+    async def get_thread_messages(
+        self, *, channel_id: str, thread_ts: str, limit: int = 50
+    ) -> list[SlackThreadMessageRecord]: ...
 
     async def get_repository_config(self) -> RepositoryConfig | None: ...
 
@@ -122,6 +133,16 @@ class SupabaseRepository(Protocol):
     async def clear_pending_request(
         self, *, channel_id: str, thread_ts: str
     ) -> None: ...
+
+
+class Indexer(Protocol):
+    """Indexes a codebase into a search-capable store.
+
+    Implementations may write to Supabase ``documentation_chunks`` or ingest
+    resources into OpenViking.
+    """
+
+    async def reindex(self) -> int: ...
 
 
 class LanguageModel(Protocol):

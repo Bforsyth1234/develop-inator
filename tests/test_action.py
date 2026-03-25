@@ -112,9 +112,6 @@ class FakeSupabaseRepository:
     async def get_thread_messages(self, *, channel_id, thread_ts, limit=50):
         return []
 
-    async def match_chunks(self, query_embedding, *, query_text="", limit=5, min_similarity=0.0, metadata_filter=None):
-        return []
-
     async def get_repository_config(self) -> RepositoryConfig | None:
         return self._stored_config
 

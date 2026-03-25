@@ -109,6 +109,20 @@ class SupabaseRepository(Protocol):
         self, *, channel_id: str, thread_ts: str, target_repository: str
     ) -> None: ...
 
+    # -- Pending request (auto re-execution after repo clarification) --
+
+    async def get_pending_request(
+        self, *, channel_id: str, thread_ts: str
+    ) -> str | None: ...
+
+    async def save_pending_request(
+        self, *, channel_id: str, thread_ts: str, pending_request: str
+    ) -> None: ...
+
+    async def clear_pending_request(
+        self, *, channel_id: str, thread_ts: str
+    ) -> None: ...
+
 
 class LanguageModel(Protocol):
     async def generate(self, prompt: str) -> LLMResult: ...

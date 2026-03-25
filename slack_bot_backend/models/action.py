@@ -45,7 +45,7 @@ class ActionPlan(BaseModel):
 
 
 class ActionRouteResult(BaseModel):
-    status: Literal["completed", "error", "needs_clarification"]
+    status: Literal["completed", "error", "needs_clarification", "repo_selected"]
     provider: str
     message: str
     pr_url: str | None = None

@@ -30,6 +30,11 @@ class SupabaseResponse:
     data: JSONValue | None
 
 
+
+class _NoRowsUpdated(Exception):
+    """Internal sentinel raised when a PATCH touches zero rows."""
+
+
 class SupabasePersistenceError(RuntimeError):
     def __init__(
         self,
@@ -708,6 +713,114 @@ class ThreadContextRepository:
                 status_code=exc.status_code,
             ) from exc
 
+    # -- Pending request persistence --
+
+    async def get_pending_request(
+        self, *, channel_id: str, thread_ts: str
+    ) -> str | None:
+        """Return the stored ``pending_request`` for a thread, or *None*."""
+        try:
+            response = await self._transport.request(
+                "GET",
+                self._TABLE,
+                query={
+                    "select": "pending_request",
+                    "channel_id": f"eq.{channel_id}",
+                    "thread_ts": f"eq.{thread_ts}",
+                    "limit": "1",
+                },
+            )
+        except SupabasePersistenceError as exc:
+            logger.warning(
+                "Failed to load pending_request from Supabase",
+                extra=exc.to_dict(),
+            )
+            return None
+
+        rows = response.data
+        if not isinstance(rows, list) or len(rows) == 0:
+            return None
+        row = _expect_mapping(rows[0], "slack_thread_contexts row")
+        return _string_or_none(row.get("pending_request"))
+
+    async def save_pending_request(
+        self, *, channel_id: str, thread_ts: str, pending_request: str
+    ) -> None:
+        """Save (upsert) a pending request for a thread.
+
+        We first attempt a PATCH (update) on the existing row.  If the row
+        does not exist yet we fall back to a POST (insert) that explicitly
+        includes ``target_repository`` as *null* so the NOT-NULL-free schema
+        is satisfied.
+        """
+        update_payload: dict[str, JSONValue] = {
+            "pending_request": pending_request,
+            "updated_at": datetime.now().isoformat(),
+        }
+        try:
+            resp = await self._transport.request(
+                "PATCH",
+                self._TABLE,
+                query={
+                    "channel_id": f"eq.{channel_id}",
+                    "thread_ts": f"eq.{thread_ts}",
+                },
+                json_body=update_payload,
+                headers={"Prefer": "return=headers-only"},
+            )
+            # Supabase returns an empty list for PATCH when no rows match.
+            # If the response looks like it touched 0 rows, fall through to INSERT.
+            if resp.data is not None and isinstance(resp.data, list) and len(resp.data) == 0:
+                raise _NoRowsUpdated()
+        except (_NoRowsUpdated, SupabasePersistenceError):
+            # Row does not exist yet — insert with all columns.
+            insert_payload: dict[str, JSONValue] = {
+                "channel_id": channel_id,
+                "thread_ts": thread_ts,
+                "target_repository": None,
+                "pending_request": pending_request,
+                "updated_at": datetime.now().isoformat(),
+            }
+            try:
+                await self._transport.request(
+                    "POST",
+                    self._TABLE,
+                    json_body=insert_payload,
+                    headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+                )
+            except SupabasePersistenceError as exc:
+                logger.exception(
+                    "Failed to save pending_request in Supabase: %s (details=%s)",
+                    exc,
+                    exc.details,
+                )
+
+    async def clear_pending_request(
+        self, *, channel_id: str, thread_ts: str
+    ) -> None:
+        """Clear the pending request for a thread (set to NULL)."""
+        update_payload: dict[str, JSONValue] = {
+            "pending_request": None,
+            "updated_at": datetime.now().isoformat(),
+        }
+        try:
+            await self._transport.request(
+                "PATCH",
+                self._TABLE,
+                query={
+                    "channel_id": f"eq.{channel_id}",
+                    "thread_ts": f"eq.{thread_ts}",
+                },
+                json_body=update_payload,
+                headers={"Prefer": "return=minimal"},
+            )
+        except SupabasePersistenceError as exc:
+            logger.warning(
+                "Failed to clear pending_request in Supabase: %s (details=%s)",
+                exc,
+                exc.details,
+            )
+
 
 class SupabasePersistenceRepository:
     def __init__(self, transport: AsyncSupabaseTransport) -> None:
@@ -822,6 +935,31 @@ class SupabasePersistenceRepository:
             channel_id=channel_id,
             thread_ts=thread_ts,
             target_repository=target_repository,
+        )
+
+    # -- Pending request persistence --
+
+    async def get_pending_request(
+        self, *, channel_id: str, thread_ts: str
+    ) -> str | None:
+        return await self._thread_contexts.get_pending_request(
+            channel_id=channel_id, thread_ts=thread_ts,
+        )
+
+    async def save_pending_request(
+        self, *, channel_id: str, thread_ts: str, pending_request: str
+    ) -> None:
+        await self._thread_contexts.save_pending_request(
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            pending_request=pending_request,
+        )
+
+    async def clear_pending_request(
+        self, *, channel_id: str, thread_ts: str
+    ) -> None:
+        await self._thread_contexts.clear_pending_request(
+            channel_id=channel_id, thread_ts=thread_ts,
         )
 
 

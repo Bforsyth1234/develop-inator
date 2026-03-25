@@ -205,6 +205,18 @@ class ActionWorkflow:
             return target
         return None
 
+    def _extract_repo_from_message(self, text: str) -> str | None:
+        """Check if the user's message text contains a valid repo from ``repo_map``.
+
+        This handles the case where the user replies with just a repo name
+        (e.g. ``Bforsyth1234/rfpinator``) after a "which repository?" clarification.
+        """
+        stripped = text.strip()
+        for repo_key in self.repo_map:
+            if repo_key == stripped or repo_key in stripped:
+                return repo_key
+        return None
+
     async def _get_active_thread_repo(self, request: ActionRequest) -> str | None:
         """Fetch the remembered target repository for this thread, if any."""
         if self.supabase is None:
@@ -243,10 +255,109 @@ class ActionWorkflow:
                 exc_info=True,
             )
 
+    async def _save_pending_request(self, request: ActionRequest) -> None:
+        """Save the original user request so it can be re-executed after repo clarification."""
+        if self.supabase is None:
+            return
+        try:
+            await self.supabase.save_pending_request(
+                channel_id=request.channel,
+                thread_ts=request.thread_ts,
+                pending_request=request.request,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to save pending request",
+                extra={"channel": request.channel, "thread_ts": request.thread_ts},
+                exc_info=True,
+            )
+
+    async def _get_pending_request(self, request: ActionRequest) -> str | None:
+        """Retrieve a stored pending request for this thread, if any."""
+        if self.supabase is None:
+            return None
+        try:
+            return await self.supabase.get_pending_request(
+                channel_id=request.channel,
+                thread_ts=request.thread_ts,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to read pending request",
+                extra={"channel": request.channel, "thread_ts": request.thread_ts},
+                exc_info=True,
+            )
+            return None
+
+    async def _clear_pending_request(self, request: ActionRequest) -> None:
+        """Clear the stored pending request after successful re-execution."""
+        if self.supabase is None:
+            return
+        try:
+            await self.supabase.clear_pending_request(
+                channel_id=request.channel,
+                thread_ts=request.thread_ts,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to clear pending request",
+                extra={"channel": request.channel, "thread_ts": request.thread_ts},
+                exc_info=True,
+            )
+
     async def run(self, request: ActionRequest) -> ActionRouteResult:
         try:
             # ── Pre-flight: fetch remembered thread context ──
             active_thread_repo = await self._get_active_thread_repo(request)
+            logger.info(
+                "ACTION run: channel=%s thread_ts=%s active_thread_repo=%s repo_map=%s",
+                request.channel, request.thread_ts, active_thread_repo, self.repo_map,
+            )
+
+            # ── Repo-name reply detection ──
+            # If the thread has no saved repo yet, check whether the user's
+            # message is simply a repository name (a reply to "which repo?").
+            # If so, persist it as the thread context and check for a stored
+            # pending request to auto re-execute.
+            if active_thread_repo is None and self.repo_map:
+                matched_repo = self._extract_repo_from_message(request.request)
+                logger.info("Repo-name extraction: request=%r matched=%s", request.request, matched_repo)
+                if matched_repo is not None:
+                    await self._save_thread_context(request, matched_repo)
+
+                    # Check if there's a pending request to re-execute
+                    pending = await self._get_pending_request(request)
+                    if pending is not None:
+                        logger.info(
+                            "Re-executing pending request: %r with repo=%s",
+                            pending, matched_repo,
+                        )
+                        await self._clear_pending_request(request)
+                        await self._post_message(
+                            request,
+                            f":white_check_mark: Got it — targeting `{matched_repo}`. "
+                            f"Now executing your original request…",
+                        )
+                        # Re-invoke run() with the original request and the
+                        # now-known thread context.
+                        replay_request = ActionRequest(
+                            channel=request.channel,
+                            thread_ts=request.thread_ts,
+                            request=pending,
+                        )
+                        return await self.run(replay_request)
+
+                    # No pending request — just confirm the repo selection
+                    message = (
+                        f":white_check_mark: Got it — I'll target `{matched_repo}` "
+                        "for this thread. What would you like me to do?"
+                    )
+                    await self._post_message(request, message)
+                    return ActionRouteResult(
+                        status="repo_selected",
+                        provider="system",
+                        message=message,
+                    )
 
             eval_result = await self._evaluate_request(
                 request, active_thread_repo=active_thread_repo,
@@ -258,8 +369,20 @@ class ActionWorkflow:
             target_repo_key: str | None = None
             if self.repo_map:
                 target_repo_key = self._resolve_target_repository(eval_result)
+                # Fall back to the thread-level memory if the evaluator
+                # didn't return a valid repository (e.g. user already
+                # clarified in a previous message).
+                if target_repo_key is None and active_thread_repo is not None:
+                    logger.info(
+                        "Evaluator did not specify target repo; using thread context: %s",
+                        active_thread_repo,
+                    )
+                    target_repo_key = active_thread_repo
                 if target_repo_key is None:
-                    # LLM didn't pick a valid repo — ask the user
+                    # Neither the evaluator nor thread context provided a repo.
+                    # Save the original request so we can auto re-execute it
+                    # once the user tells us which repo to target.
+                    await self._save_pending_request(request)
                     repo_list = ", ".join(f"`{k}`" for k in self.repo_map)
                     message = (
                         ":thinking_face: I couldn't determine which repository "

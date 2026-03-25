@@ -156,6 +156,35 @@ class StubSupabaseRepository(SupabaseRepository):
             },
         )
 
+    async def get_pending_request(
+        self, *, channel_id: str, thread_ts: str
+    ) -> str | None:
+        logger.info(
+            "Stub get_pending_request invoked",
+            extra={"channel_id": channel_id, "thread_ts": thread_ts},
+        )
+        return None
+
+    async def save_pending_request(
+        self, *, channel_id: str, thread_ts: str, pending_request: str
+    ) -> None:
+        logger.info(
+            "Stub save_pending_request invoked",
+            extra={
+                "channel_id": channel_id,
+                "thread_ts": thread_ts,
+                "pending_request": pending_request,
+            },
+        )
+
+    async def clear_pending_request(
+        self, *, channel_id: str, thread_ts: str
+    ) -> None:
+        logger.info(
+            "Stub clear_pending_request invoked",
+            extra={"channel_id": channel_id, "thread_ts": thread_ts},
+        )
+
 
 class StubLanguageModel(LanguageModel):
     async def generate(self, prompt: str) -> LLMResult:

@@ -49,6 +49,7 @@ class FakeSupabaseRepository:
         self.documents = documents or []
         self.thread_calls: list[dict[str, str | int]] = []
         self.saved_configs: list[dict[str, str]] = []
+        self._pending_requests: dict[tuple[str, str], str] = {}
 
     async def healthcheck(self) -> bool:
         return True
@@ -91,6 +92,36 @@ class FakeSupabaseRepository:
         self, execution_id: str, status: ActionExecutionStatus
     ) -> None:
         pass
+
+    async def get_thread_context(
+        self, *, channel_id: str, thread_ts: str
+    ) -> str | None:
+        return None
+
+    async def upsert_thread_context(
+        self, *, channel_id: str, thread_ts: str, target_repository: str
+    ) -> None:
+        self.thread_context_upserts: list[dict[str, str]] = getattr(self, "thread_context_upserts", [])
+        self.thread_context_upserts.append({
+            "channel_id": channel_id,
+            "thread_ts": thread_ts,
+            "target_repository": target_repository,
+        })
+
+    async def get_pending_request(
+        self, *, channel_id: str, thread_ts: str
+    ) -> str | None:
+        return self._pending_requests.get((channel_id, thread_ts))
+
+    async def save_pending_request(
+        self, *, channel_id: str, thread_ts: str, pending_request: str
+    ) -> None:
+        self._pending_requests[(channel_id, thread_ts)] = pending_request
+
+    async def clear_pending_request(
+        self, *, channel_id: str, thread_ts: str
+    ) -> None:
+        self._pending_requests.pop((channel_id, thread_ts), None)
 
 
 class FakeLanguageModel:
@@ -292,6 +323,50 @@ class IntentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(supabase.saved_configs[0]["github_repository"], "org/new-repo")
         self.assertEqual(len(slack.messages), 1)
         self.assertIn("updated", slack.messages[0]["text"])
+
+    async def test_pending_request_fast_path_skips_classification(self) -> None:
+        """When a pending request exists, skip LLM classification and route to ACTION."""
+        slack = FakeSlackGateway()
+        action = FakeActionWorkflow()
+        supabase = FakeSupabaseRepository()
+        # Simulate a pending request stored from a prior "which repo?" clarification.
+        supabase._pending_requests = {("C123", "1710.5"): "change the color scheme to rainbow"}
+        llm = FakeLanguageModel(
+            # classify_answer is irrelevant — we should never reach the LLM
+            classify_answer='{"intent":"CONFIGURE","rationale":"User sent a repo name."}',
+        )
+        workflow = IntentWorkflow(
+            slack=slack,
+            supabase=supabase,
+            llm=llm,
+            action=action,
+        )
+
+        # This is a threaded reply (thread_ts points to parent), so thread_ts is set.
+        classification = await workflow.process_app_mention(
+            SlackEventEnvelope(
+                type="event_callback",
+                event=SlackEvent(
+                    type="app_mention",
+                    channel="C123",
+                    user="U999",
+                    text="<@BOT> Bforsyth1234/rfpinator",
+                    ts="1710.6",
+                    thread_ts="1710.5",
+                ),
+            )
+        )
+
+        self.assertIsNotNone(classification)
+        # Fast-path returns ACTION classification directly
+        self.assertEqual(str(classification.intent), "ACTION")
+        # Should have been routed to ACTION
+        self.assertEqual(len(action.requests), 1)
+        self.assertEqual(action.requests[0]["request"], "Bforsyth1234/rfpinator")
+        # No config saves should have happened
+        self.assertEqual(len(supabase.saved_configs), 0)
+        # LLM should NOT have been called for classification
+        self.assertEqual(len(llm.prompts), 0)
 
     async def test_configure_without_workflow_posts_fallback(self) -> None:
         slack = FakeSlackGateway()

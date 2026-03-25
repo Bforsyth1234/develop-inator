@@ -93,12 +93,14 @@ class FakeSupabaseRepository:
         pr_mapping: ActivePullRequestRecord | None = None,
         stored_execution: ActionExecution | None = None,
         thread_context: dict[tuple[str, str], str] | None = None,
+        pending_requests: dict[tuple[str, str], str] | None = None,
     ) -> None:
         self._stored_config = stored_config
         self._fail_save = fail_save
         self._pr_mapping = pr_mapping
         self._stored_execution = stored_execution
         self._thread_contexts: dict[tuple[str, str], str] = dict(thread_context or {})
+        self._pending_requests: dict[tuple[str, str], str] = dict(pending_requests or {})
         self.save_calls: list[dict[str, str]] = []
         self.pr_mapping_saves: list[ActivePullRequestRecord] = []
         self.execution_status_updates: list[tuple[str, ActionExecutionStatus]] = []
@@ -176,6 +178,23 @@ class FakeSupabaseRepository:
             "thread_ts": thread_ts,
             "target_repository": target_repository,
         })
+
+    # -- Pending request persistence --
+
+    async def get_pending_request(
+        self, *, channel_id: str, thread_ts: str
+    ) -> str | None:
+        return self._pending_requests.get((channel_id, thread_ts))
+
+    async def save_pending_request(
+        self, *, channel_id: str, thread_ts: str, pending_request: str
+    ) -> None:
+        self._pending_requests[(channel_id, thread_ts)] = pending_request
+
+    async def clear_pending_request(
+        self, *, channel_id: str, thread_ts: str
+    ) -> None:
+        self._pending_requests.pop((channel_id, thread_ts), None)
 
 
 class FakeActionWorkflow:
@@ -465,6 +484,149 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Which component", slack.messages[0]["text"])
         self.assertEqual(slack.messages[0]["channel"], "C123")
         self.assertEqual(slack.messages[0]["thread_ts"], "1710.2")
+
+    async def test_repo_name_reply_saves_thread_context_and_returns_repo_selected(self) -> None:
+        """When thread has no repo context and user message is a repo name, save it."""
+        slack = FakeSlackGateway()
+        git = FakeGitService()
+        supabase = FakeSupabaseRepository()
+        wf = self._make_workflow(
+            slack=slack, git=git,
+            repo_map=["owner/repo", "owner/other-repo"],
+        )
+        wf.supabase = supabase
+
+        result = await wf.run(
+            ActionRequest(channel="C123", thread_ts="1710.2", request="owner/repo")
+        )
+
+        self.assertEqual(result.status, "repo_selected")
+        self.assertEqual(result.provider, "system")
+        self.assertEqual(len(supabase.thread_context_upserts), 1)
+        self.assertEqual(supabase.thread_context_upserts[0]["target_repository"], "owner/repo")
+        self.assertIn("owner/repo", slack.messages[0]["text"])
+
+    async def test_repo_name_reply_with_pending_request_re_executes(self) -> None:
+        """When user replies with repo name and there's a stored pending request, auto re-execute."""
+        slack = FakeSlackGateway()
+        git = FakeGitService()
+        supabase = FakeSupabaseRepository(
+            pending_requests={("C123", "1710.2"): "Change the color scheme to rainbow"},
+        )
+        wf = self._make_workflow(
+            slack=slack, git=git,
+            repo_map=["owner/repo", "owner/other-repo"],
+        )
+        wf.supabase = supabase
+
+        with mock.patch(
+            "slack_bot_backend.workflows.action.asyncio.to_thread",
+            side_effect=_make_successful_side_effect(),
+        ):
+            result = await wf.run(
+                ActionRequest(channel="C123", thread_ts="1710.2", request="owner/repo")
+            )
+
+        # Should have re-executed (completed), not just returned repo_selected
+        self.assertEqual(result.status, "completed")
+        # Thread context should have been saved
+        self.assertTrue(any(
+            u["target_repository"] == "owner/repo"
+            for u in supabase.thread_context_upserts
+        ))
+        # Pending request should have been cleared
+        self.assertIsNone(
+            await supabase.get_pending_request(channel_id="C123", thread_ts="1710.2")
+        )
+        # Confirmation message should mention the repo
+        self.assertTrue(any("owner/repo" in m["text"] for m in slack.messages))
+
+    async def test_repo_clarification_saves_pending_request(self) -> None:
+        """When bot asks 'which repo?', it should save the original request."""
+        slack = FakeSlackGateway()
+        git = FakeGitService()
+        supabase = FakeSupabaseRepository()
+        # Evaluator returns actionable but no target_repository
+        llm = FakeLanguageModel(evaluator_json={
+            "is_actionable": True,
+            "clarifying_question": None,
+            "optimized_prompt": "Change the color scheme",
+            "complexity_tier": "simple",
+            "target_repository": None,
+        })
+        wf = self._make_workflow(
+            slack=slack, git=git, llm=llm,
+            repo_map=["owner/repo", "owner/other-repo"],
+        )
+        wf.supabase = supabase
+
+        result = await wf.run(
+            ActionRequest(channel="C123", thread_ts="1710.2", request="Change the color scheme")
+        )
+
+        self.assertEqual(result.status, "needs_clarification")
+        # The original request should be persisted
+        stored = await supabase.get_pending_request(
+            channel_id="C123", thread_ts="1710.2"
+        )
+        self.assertEqual(stored, "Change the color scheme")
+
+    async def test_repo_name_reply_skipped_when_thread_already_has_context(self) -> None:
+        """If thread already has a repo, don't treat message as repo selection."""
+        slack = FakeSlackGateway()
+        git = FakeGitService()
+        supabase = FakeSupabaseRepository(
+            thread_context={("C123", "1710.2"): "owner/repo"},
+        )
+        wf = self._make_workflow(
+            slack=slack, git=git,
+            repo_map=["owner/repo", "owner/other-repo"],
+        )
+        wf.supabase = supabase
+
+        with mock.patch(
+            "slack_bot_backend.workflows.action.asyncio.to_thread",
+            side_effect=_make_successful_side_effect(),
+        ):
+            result = await wf.run(
+                ActionRequest(channel="C123", thread_ts="1710.2", request="Fix the bug")
+            )
+
+        # Should proceed normally, not return repo_selected
+        self.assertNotEqual(result.status, "repo_selected")
+
+    async def test_thread_context_provides_repo_when_evaluator_does_not(self) -> None:
+        """When evaluator omits target_repository but thread context has it, use thread context."""
+        slack = FakeSlackGateway()
+        git = FakeGitService()
+        supabase = FakeSupabaseRepository(
+            thread_context={("C123", "1710.2"): "owner/repo"},
+        )
+        # Evaluator returns actionable but without target_repository
+        llm = FakeLanguageModel(evaluator_json={
+            "is_actionable": True,
+            "clarifying_question": None,
+            "optimized_prompt": "Fix the bug",
+            "complexity_tier": "simple",
+            "target_repository": None,
+        })
+        wf = self._make_workflow(
+            slack=slack, git=git, llm=llm,
+            repo_map=["owner/repo", "owner/other-repo"],
+        )
+        wf.supabase = supabase
+
+        with mock.patch(
+            "slack_bot_backend.workflows.action.asyncio.to_thread",
+            side_effect=_make_successful_side_effect(),
+        ):
+            result = await wf.run(
+                ActionRequest(channel="C123", thread_ts="1710.2", request="Fix the bug")
+            )
+
+        # Should complete successfully using thread context repo, NOT ask for clarification
+        self.assertEqual(result.status, "completed")
+        self.assertNotEqual(result.status, "needs_clarification")
 
     async def test_evaluator_invalid_json_falls_back_to_original_request(self) -> None:
         """If the evaluator returns garbage JSON, the workflow runs with the raw request."""

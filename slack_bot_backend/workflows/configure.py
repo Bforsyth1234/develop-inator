@@ -76,6 +76,20 @@ class ConfigureWorkflow:
                 github_repository=final_github_repo,
             )
 
+            # Also persist as thread context so the ACTION workflow can pick
+            # it up on subsequent messages in this same thread.
+            try:
+                await self.supabase.upsert_thread_context(
+                    channel_id=channel,
+                    thread_ts=thread_ts,
+                    target_repository=final_github_repo,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to persist thread context from CONFIGURE workflow",
+                    exc_info=True,
+                )
+
             self.github_repository = final_github_repo
 
             changes: list[str] = []

@@ -6,7 +6,7 @@ import logging
 
 from slack_bot_backend.models.persistence import DocumentationMatch, SlackThreadMessageRecord
 from slack_bot_backend.models.question import QuestionRequest, QuestionRouteResult
-from slack_bot_backend.services.interfaces import LanguageModel, SlackGateway, SupabaseRepository
+from slack_bot_backend.services.interfaces import ContextSearch, LanguageModel, SlackGateway, SupabaseRepository
 
 logger = logging.getLogger(__name__)
 
@@ -18,12 +18,14 @@ class QuestionWorkflow:
         supabase: SupabaseRepository,
         llm: LanguageModel,
         *,
+        context_search: ContextSearch | None = None,
         thread_history_limit: int = 8,
         retrieval_limit: int = 4,
     ) -> None:
         self.slack = slack
         self.supabase = supabase
         self.llm = llm
+        self.context_search = context_search
         self.thread_history_limit = thread_history_limit
         self.retrieval_limit = retrieval_limit
 
@@ -34,12 +36,14 @@ class QuestionWorkflow:
                 thread_ts=request.thread_ts,
                 limit=self.thread_history_limit,
             )
-            embedding = await self.llm.embed(request.question)
-            documents = await self.supabase.match_chunks(
-                embedding.vector,
-                query_text=request.question,
-                limit=self.retrieval_limit,
-            )
+            documents: list[DocumentationMatch] = []
+            if self.context_search is not None:
+                embedding = await self.llm.embed(request.question)
+                documents = await self.context_search.match_chunks(
+                    embedding.vector,
+                    query_text=request.question,
+                    limit=self.retrieval_limit,
+                )
             prompt = self._build_prompt(request, thread_messages, documents)
             llm_result = await self.llm.generate(prompt)
             answer = llm_result.content.strip() or "I couldn't produce a grounded answer for that question."

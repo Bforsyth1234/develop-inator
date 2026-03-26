@@ -10,9 +10,9 @@ from fastapi import Request
 
 from .config import GitProvider, LLMProvider, Settings
 from .services.indexer import CodebaseIndexer
-from .services.interfaces import GitService, LanguageModel, SlackGateway, SupabaseRepository  # noqa: F401 – LanguageModel kept for external callers
+from .services.interfaces import ContextSearch, GitService, Indexer, LanguageModel, SlackGateway, SupabaseRepository  # noqa: F401 – LanguageModel kept for external callers
 from .services.supabase_persistence import SupabasePersistenceRepository, UrllibSupabaseTransport
-from .services.stubs import StubGitService, StubLanguageModel, StubSlackGateway, StubSupabaseRepository
+from .services.stubs import StubContextSearch, StubGitService, StubLanguageModel, StubSlackGateway, StubSupabaseRepository
 from .workflows.configure import ConfigureWorkflow
 from .workflows.intent import IntentWorkflow
 from .workflows.question import QuestionWorkflow
@@ -33,14 +33,16 @@ class ServiceContainer:
     intent: IntentWorkflow
     question: QuestionWorkflow
     action: ActionWorkflow
+    context_search: ContextSearch | None = None
     configure: ConfigureWorkflow | None = None
-    indexer: CodebaseIndexer | None = None
+    indexer: Indexer | None = None
 
 
 def build_service_container(settings: Settings) -> ServiceContainer:
     slack = _build_slack_gateway(settings)
     supabase = _build_supabase_repository(settings)
     llm = _build_language_model(settings)
+    context_search = _build_context_search(settings)
 
     git = _build_git_service(settings)
     action = _build_action_workflow(
@@ -51,11 +53,13 @@ def build_service_container(settings: Settings) -> ServiceContainer:
         github_token=settings.github_token or "",
         repo_map=settings.repo_map,
         settings=settings,
+        context_search=context_search,
     )
     question = QuestionWorkflow(
         slack=slack,
         supabase=supabase,
         llm=llm,
+        context_search=context_search,
         thread_history_limit=settings.slack_thread_context_limit,
     )
     configure = ConfigureWorkflow(
@@ -81,8 +85,27 @@ def build_service_container(settings: Settings) -> ServiceContainer:
         ),
         question=question,
         action=action,
+        context_search=context_search,
         configure=configure,
         indexer=indexer,
+    )
+
+
+def _build_context_search(settings: Settings) -> ContextSearch | None:
+    """Build the semantic search backend.
+
+    Returns an OpenViking-backed service when enabled, otherwise ``None``
+    (callers should treat ``None`` as "no context search available").
+    """
+    if not settings.openviking_enabled:
+        return StubContextSearch()
+    if not settings.openviking_url:
+        raise ValueError("OPENVIKING_URL is required when OpenViking is enabled")
+    from .services.openviking_context import OpenVikingContextService
+
+    return OpenVikingContextService(
+        openviking_url=settings.openviking_url,
+        openviking_api_key=settings.openviking_api_key,
     )
 
 
@@ -229,6 +252,7 @@ def _build_action_workflow(
     github_token: str,
     repo_map: list[str] | None = None,
     settings: Settings,
+    context_search: ContextSearch | None = None,
 ) -> ActionWorkflow:
     from .workflows.action import ActionWorkflow
 
@@ -243,14 +267,32 @@ def _build_action_workflow(
             "simple": settings.aider_model_simple,
             "complex": settings.aider_model_complex,
         },
+        context_search=context_search,
     )
 
 
 def _build_indexer(
     settings: Settings,
-) -> CodebaseIndexer | None:
-    # The indexer requires at least one repository in the repo_map.
+) -> Indexer | None:
     first_repo = next(iter(settings.repo_map), None) if settings.repo_map else None
+
+    # Prefer OpenViking when enabled — it handles chunking & embedding natively.
+    if (
+        settings.openviking_enabled
+        and settings.openviking_url
+        and settings.github_token
+        and first_repo
+    ):
+        from .services.openviking_context import OpenVikingIndexer
+
+        return OpenVikingIndexer(
+            openviking_url=settings.openviking_url,
+            openviking_api_key=settings.openviking_api_key,
+            github_token=settings.github_token,
+            github_repository=first_repo,
+        )
+
+    # Fall back to the Supabase-based indexer.
     if (
         not settings.supabase_enabled
         or not settings.supabase_url

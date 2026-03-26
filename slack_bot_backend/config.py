@@ -80,6 +80,11 @@ class Settings(BaseModel):
     redis_url: str = "redis://localhost:6379/0"
     celery_broker_url: str = "redis://localhost:6379/0"
 
+    # OpenViking context search (semantic search / documentation chunks)
+    openviking_enabled: bool = False
+    openviking_url: str | None = None
+    openviking_api_key: str | None = Field(default=None, repr=False)
+
     # Aider execution — both tiers default to Claude Sonnet because weaker
     # models (e.g. Groq/Llama) can't reliably produce valid code edits in
     # any of Aider's edit formats (diff, whole, udiff).
@@ -106,6 +111,8 @@ class Settings(BaseModel):
             raise ValueError("LLM_API_KEY is required for the router provider (used for standard/heavy tiers)")
         if self.git_provider is GitProvider.GITHUB and not self.github_token:
             raise ValueError("GITHUB_TOKEN is required when using the GitHub provider")
+        if self.openviking_enabled and not self.openviking_url:
+            raise ValueError("OPENVIKING_URL is required when OpenViking is enabled")
         return self
 
     @classmethod
@@ -146,6 +153,9 @@ class Settings(BaseModel):
             "github_bot_username": source.get("SLACK_BOT_GITHUB_BOT_USERNAME"),
             "redis_url": source.get("SLACK_BOT_REDIS_URL"),
             "celery_broker_url": source.get("SLACK_BOT_CELERY_BROKER_URL"),
+            "openviking_enabled": source.get("SLACK_BOT_OPENVIKING_ENABLED"),
+            "openviking_url": source.get("SLACK_BOT_OPENVIKING_URL"),
+            "openviking_api_key": source.get("SLACK_BOT_OPENVIKING_API_KEY"),
             "aider_model_simple": source.get("AIDER_MODEL_SIMPLE"),
             "aider_model_complex": source.get("AIDER_MODEL_COMPLEX"),
         }

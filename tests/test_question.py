@@ -20,26 +20,16 @@ class FakeSlackGateway:
         self.messages.append({"channel": channel, "text": text, "thread_ts": thread_ts})
 
 
-class FakeSupabaseRepository:
+class FakeContextSearch:
     def __init__(
         self,
         *,
-        thread_messages: list[SlackThreadMessageRecord] | None = None,
         documents: list[DocumentationMatch] | None = None,
         retrieval_error: Exception | None = None,
     ) -> None:
-        self.thread_messages = thread_messages or []
         self.documents = documents or []
         self.retrieval_error = retrieval_error
         self.last_embedding: tuple[float, ...] | None = None
-
-    async def healthcheck(self) -> bool:
-        return True
-
-    async def get_thread_messages(
-        self, *, channel_id: str, thread_ts: str, limit: int = 50
-    ) -> list[SlackThreadMessageRecord]:
-        return self.thread_messages[:limit]
 
     async def match_chunks(
         self,
@@ -54,6 +44,23 @@ class FakeSupabaseRepository:
             raise self.retrieval_error
         self.last_embedding = query_embedding
         return self.documents[:limit]
+
+
+class FakeSupabaseRepository:
+    def __init__(
+        self,
+        *,
+        thread_messages: list[SlackThreadMessageRecord] | None = None,
+    ) -> None:
+        self.thread_messages = thread_messages or []
+
+    async def healthcheck(self) -> bool:
+        return True
+
+    async def get_thread_messages(
+        self, *, channel_id: str, thread_ts: str, limit: int = 50
+    ) -> list[SlackThreadMessageRecord]:
+        return self.thread_messages[:limit]
 
 
 class FakeLanguageModel:
@@ -106,6 +113,8 @@ class QuestionWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     user_id="U123",
                 )
             ],
+        )
+        context_search = FakeContextSearch(
             documents=[
                 DocumentationMatch(
                     source_type="runbook",
@@ -119,7 +128,7 @@ class QuestionWorkflowTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         llm = FakeLanguageModel(answer="Redeploy the previous stable image.")
-        workflow = QuestionWorkflow(slack=slack, supabase=supabase, llm=llm)
+        workflow = QuestionWorkflow(slack=slack, supabase=supabase, llm=llm, context_search=context_search)
 
         result = await workflow.run(
             QuestionRequest(channel="C123", thread_ts="1710.2", question="How do we roll back?", user_id="U456")
@@ -148,7 +157,7 @@ class QuestionWorkflowTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
         llm = FakeLanguageModel(answer="I couldn't find docs, but based on the thread context this needs investigation.")
-        workflow = QuestionWorkflow(slack=slack, supabase=supabase, llm=llm)
+        workflow = QuestionWorkflow(slack=slack, supabase=supabase, llm=llm, context_search=FakeContextSearch())
 
         result = await workflow.run(
             QuestionRequest(channel="C123", thread_ts="1710.2", question="What should we do next?")
@@ -162,9 +171,10 @@ class QuestionWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_question_workflow_posts_error_response_when_retrieval_fails(self) -> None:
         slack = FakeSlackGateway()
-        supabase = FakeSupabaseRepository(retrieval_error=RuntimeError("pgvector unavailable"))
+        supabase = FakeSupabaseRepository()
+        context_search = FakeContextSearch(retrieval_error=RuntimeError("pgvector unavailable"))
         llm = FakeLanguageModel()
-        workflow = QuestionWorkflow(slack=slack, supabase=supabase, llm=llm)
+        workflow = QuestionWorkflow(slack=slack, supabase=supabase, llm=llm, context_search=context_search)
 
         result = await workflow.run(
             QuestionRequest(channel="C123", thread_ts="1710.2", question="What broke?")
@@ -181,7 +191,8 @@ class QuestionWorkflowTests(unittest.IsolatedAsyncioTestCase):
 class QuestionEndpointTests(unittest.TestCase):
     def test_question_endpoint_returns_workflow_result(self) -> None:
         slack = FakeSlackGateway()
-        supabase = FakeSupabaseRepository(
+        supabase = FakeSupabaseRepository()
+        context_search = FakeContextSearch(
             documents=[
                 DocumentationMatch(
                     source_type="doc",
@@ -195,7 +206,7 @@ class QuestionEndpointTests(unittest.TestCase):
             ]
         )
         llm = FakeLanguageModel(answer="Restart the worker deployment.")
-        question = QuestionWorkflow(slack=slack, supabase=supabase, llm=llm)
+        question = QuestionWorkflow(slack=slack, supabase=supabase, llm=llm, context_search=context_search)
         container = ServiceContainer(
             settings=Settings(environment="testing"),
             slack=slack,

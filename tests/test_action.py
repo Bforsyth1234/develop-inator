@@ -93,12 +93,14 @@ class FakeSupabaseRepository:
         pr_mapping: ActivePullRequestRecord | None = None,
         stored_execution: ActionExecution | None = None,
         thread_context: dict[tuple[str, str], str] | None = None,
+        pending_requests: dict[tuple[str, str], str] | None = None,
     ) -> None:
         self._stored_config = stored_config
         self._fail_save = fail_save
         self._pr_mapping = pr_mapping
         self._stored_execution = stored_execution
         self._thread_contexts: dict[tuple[str, str], str] = dict(thread_context or {})
+        self._pending_requests: dict[tuple[str, str], str] = dict(pending_requests or {})
         self.save_calls: list[dict[str, str]] = []
         self.pr_mapping_saves: list[ActivePullRequestRecord] = []
         self.execution_status_updates: list[tuple[str, ActionExecutionStatus]] = []
@@ -108,9 +110,6 @@ class FakeSupabaseRepository:
         return True
 
     async def get_thread_messages(self, *, channel_id, thread_ts, limit=50):
-        return []
-
-    async def match_chunks(self, query_embedding, *, query_text="", limit=5, min_similarity=0.0, metadata_filter=None):
         return []
 
     async def get_repository_config(self) -> RepositoryConfig | None:
@@ -176,6 +175,23 @@ class FakeSupabaseRepository:
             "thread_ts": thread_ts,
             "target_repository": target_repository,
         })
+
+    # -- Pending request persistence --
+
+    async def get_pending_request(
+        self, *, channel_id: str, thread_ts: str
+    ) -> str | None:
+        return self._pending_requests.get((channel_id, thread_ts))
+
+    async def save_pending_request(
+        self, *, channel_id: str, thread_ts: str, pending_request: str
+    ) -> None:
+        self._pending_requests[(channel_id, thread_ts)] = pending_request
+
+    async def clear_pending_request(
+        self, *, channel_id: str, thread_ts: str
+    ) -> None:
+        self._pending_requests.pop((channel_id, thread_ts), None)
 
 
 class FakeActionWorkflow:
@@ -465,6 +481,149 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Which component", slack.messages[0]["text"])
         self.assertEqual(slack.messages[0]["channel"], "C123")
         self.assertEqual(slack.messages[0]["thread_ts"], "1710.2")
+
+    async def test_repo_name_reply_saves_thread_context_and_returns_repo_selected(self) -> None:
+        """When thread has no repo context and user message is a repo name, save it."""
+        slack = FakeSlackGateway()
+        git = FakeGitService()
+        supabase = FakeSupabaseRepository()
+        wf = self._make_workflow(
+            slack=slack, git=git,
+            repo_map=["owner/repo", "owner/other-repo"],
+        )
+        wf.supabase = supabase
+
+        result = await wf.run(
+            ActionRequest(channel="C123", thread_ts="1710.2", request="owner/repo")
+        )
+
+        self.assertEqual(result.status, "repo_selected")
+        self.assertEqual(result.provider, "system")
+        self.assertEqual(len(supabase.thread_context_upserts), 1)
+        self.assertEqual(supabase.thread_context_upserts[0]["target_repository"], "owner/repo")
+        self.assertIn("owner/repo", slack.messages[0]["text"])
+
+    async def test_repo_name_reply_with_pending_request_re_executes(self) -> None:
+        """When user replies with repo name and there's a stored pending request, auto re-execute."""
+        slack = FakeSlackGateway()
+        git = FakeGitService()
+        supabase = FakeSupabaseRepository(
+            pending_requests={("C123", "1710.2"): "Change the color scheme to rainbow"},
+        )
+        wf = self._make_workflow(
+            slack=slack, git=git,
+            repo_map=["owner/repo", "owner/other-repo"],
+        )
+        wf.supabase = supabase
+
+        with mock.patch(
+            "slack_bot_backend.workflows.action.asyncio.to_thread",
+            side_effect=_make_successful_side_effect(),
+        ):
+            result = await wf.run(
+                ActionRequest(channel="C123", thread_ts="1710.2", request="owner/repo")
+            )
+
+        # Should have re-executed (completed), not just returned repo_selected
+        self.assertEqual(result.status, "completed")
+        # Thread context should have been saved
+        self.assertTrue(any(
+            u["target_repository"] == "owner/repo"
+            for u in supabase.thread_context_upserts
+        ))
+        # Pending request should have been cleared
+        self.assertIsNone(
+            await supabase.get_pending_request(channel_id="C123", thread_ts="1710.2")
+        )
+        # Confirmation message should mention the repo
+        self.assertTrue(any("owner/repo" in m["text"] for m in slack.messages))
+
+    async def test_repo_clarification_saves_pending_request(self) -> None:
+        """When bot asks 'which repo?', it should save the original request."""
+        slack = FakeSlackGateway()
+        git = FakeGitService()
+        supabase = FakeSupabaseRepository()
+        # Evaluator returns actionable but no target_repository
+        llm = FakeLanguageModel(evaluator_json={
+            "is_actionable": True,
+            "clarifying_question": None,
+            "optimized_prompt": "Change the color scheme",
+            "complexity_tier": "simple",
+            "target_repository": None,
+        })
+        wf = self._make_workflow(
+            slack=slack, git=git, llm=llm,
+            repo_map=["owner/repo", "owner/other-repo"],
+        )
+        wf.supabase = supabase
+
+        result = await wf.run(
+            ActionRequest(channel="C123", thread_ts="1710.2", request="Change the color scheme")
+        )
+
+        self.assertEqual(result.status, "needs_clarification")
+        # The original request should be persisted
+        stored = await supabase.get_pending_request(
+            channel_id="C123", thread_ts="1710.2"
+        )
+        self.assertEqual(stored, "Change the color scheme")
+
+    async def test_repo_name_reply_skipped_when_thread_already_has_context(self) -> None:
+        """If thread already has a repo, don't treat message as repo selection."""
+        slack = FakeSlackGateway()
+        git = FakeGitService()
+        supabase = FakeSupabaseRepository(
+            thread_context={("C123", "1710.2"): "owner/repo"},
+        )
+        wf = self._make_workflow(
+            slack=slack, git=git,
+            repo_map=["owner/repo", "owner/other-repo"],
+        )
+        wf.supabase = supabase
+
+        with mock.patch(
+            "slack_bot_backend.workflows.action.asyncio.to_thread",
+            side_effect=_make_successful_side_effect(),
+        ):
+            result = await wf.run(
+                ActionRequest(channel="C123", thread_ts="1710.2", request="Fix the bug")
+            )
+
+        # Should proceed normally, not return repo_selected
+        self.assertNotEqual(result.status, "repo_selected")
+
+    async def test_thread_context_provides_repo_when_evaluator_does_not(self) -> None:
+        """When evaluator omits target_repository but thread context has it, use thread context."""
+        slack = FakeSlackGateway()
+        git = FakeGitService()
+        supabase = FakeSupabaseRepository(
+            thread_context={("C123", "1710.2"): "owner/repo"},
+        )
+        # Evaluator returns actionable but without target_repository
+        llm = FakeLanguageModel(evaluator_json={
+            "is_actionable": True,
+            "clarifying_question": None,
+            "optimized_prompt": "Fix the bug",
+            "complexity_tier": "simple",
+            "target_repository": None,
+        })
+        wf = self._make_workflow(
+            slack=slack, git=git, llm=llm,
+            repo_map=["owner/repo", "owner/other-repo"],
+        )
+        wf.supabase = supabase
+
+        with mock.patch(
+            "slack_bot_backend.workflows.action.asyncio.to_thread",
+            side_effect=_make_successful_side_effect(),
+        ):
+            result = await wf.run(
+                ActionRequest(channel="C123", thread_ts="1710.2", request="Fix the bug")
+            )
+
+        # Should complete successfully using thread context repo, NOT ask for clarification
+        self.assertEqual(result.status, "completed")
+        self.assertNotEqual(result.status, "needs_clarification")
 
     async def test_evaluator_invalid_json_falls_back_to_original_request(self) -> None:
         """If the evaluator returns garbage JSON, the workflow runs with the raw request."""
@@ -1248,6 +1407,121 @@ class SubprocessTimeoutTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("timed out", result.stderr)
+
+
+class TestRepoKeyFromPrUrl(unittest.TestCase):
+    """Unit tests for ActionWorkflow._repo_key_from_pr_url."""
+
+    def test_standard_pr_url(self) -> None:
+        result = ActionWorkflow._repo_key_from_pr_url(
+            "https://github.com/Bforsyth1234/develop-inator/pull/42"
+        )
+        self.assertEqual(result, "Bforsyth1234/develop-inator")
+
+    def test_pr_url_with_trailing_slash(self) -> None:
+        result = ActionWorkflow._repo_key_from_pr_url(
+            "https://github.com/owner/repo/pull/99/"
+        )
+        self.assertEqual(result, "owner/repo")
+
+    def test_non_pr_github_url(self) -> None:
+        result = ActionWorkflow._repo_key_from_pr_url(
+            "https://github.com/owner/repo/issues/5"
+        )
+        self.assertEqual(result, "owner/repo")
+
+    def test_non_github_url_returns_none(self) -> None:
+        result = ActionWorkflow._repo_key_from_pr_url("https://example.com/foo/bar")
+        self.assertIsNone(result)
+
+    def test_empty_string_returns_none(self) -> None:
+        result = ActionWorkflow._repo_key_from_pr_url("")
+        self.assertIsNone(result)
+
+    def test_only_owner_returns_none(self) -> None:
+        result = ActionWorkflow._repo_key_from_pr_url("https://github.com/owner")
+        self.assertIsNone(result)
+
+
+class TestHandlePrCommentPassesTargetRepo(unittest.IsolatedAsyncioTestCase):
+    """Verify handle_pr_comment resolves and passes target_repo_key to _run_aider."""
+
+    def setUp(self) -> None:
+        # Disable test detection
+        patcher = mock.patch.object(
+            ActionWorkflow, "_detect_test_command", return_value=None,
+        )
+        self._no_tests = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def test_handle_pr_comment_passes_target_repo_key(self) -> None:
+        pr_url = "https://github.com/acme/widgets/pull/7"
+        slack = FakeSlackGateway()
+        git = FakeGitService()
+        supabase = FakeSupabaseRepository(
+            pr_mapping=ActivePullRequestRecord(
+                pr_url=pr_url,
+                branch_name="ai-update-123",
+                channel_id="C999",
+                thread_ts="111.222",
+            ),
+        )
+        llm = FakeLanguageModel()
+
+        workflow = ActionWorkflow(
+            slack=slack,
+            git=git,
+            llm=llm,
+            github_token="stub",
+            model_tier_map=_DEFAULT_TIER_MAP,
+            supabase=supabase,
+            repo_map=["acme/widgets"],
+        )
+
+        captured_kwargs: dict = {}
+
+        async def fake_run_aider(request, **kwargs):
+            captured_kwargs.update(kwargs)
+            return AiderResult(
+                branch_name="ai-update-123",
+                stdout="ok",
+                stderr="",
+                returncode=0,
+            )
+
+        with mock.patch.object(workflow, "_run_aider", side_effect=fake_run_aider):
+            await workflow.handle_pr_comment(
+                pr_url=pr_url,
+                comment_body="Please fix the typo",
+                sender="reviewer",
+            )
+
+        self.assertEqual(captured_kwargs.get("target_repo_key"), "acme/widgets")
+        self.assertEqual(captured_kwargs.get("existing_branch"), "ai-update-123")
+
+    async def test_handle_pr_comment_no_mapping_is_noop(self) -> None:
+        """When no PR mapping exists, handle_pr_comment should return early."""
+        slack = FakeSlackGateway()
+        git = FakeGitService()
+        supabase = FakeSupabaseRepository()  # no pr_mapping
+
+        workflow = ActionWorkflow(
+            slack=slack,
+            git=git,
+            llm=FakeLanguageModel(),
+            github_token="stub",
+            model_tier_map=_DEFAULT_TIER_MAP,
+            supabase=supabase,
+        )
+
+        await workflow.handle_pr_comment(
+            pr_url="https://github.com/acme/widgets/pull/99",
+            comment_body="Fix it",
+            sender="someone",
+        )
+
+        # No Slack messages should be posted
+        self.assertEqual(len(slack.messages), 0)
 
 
 if __name__ == "__main__":

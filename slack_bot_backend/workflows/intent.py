@@ -67,17 +67,49 @@ class IntentWorkflow:
             )
             return None
 
+        # ── Fast-path: if this thread has a pending request (from a prior
+        #    "which repo?" clarification), skip LLM classification entirely
+        #    and route straight to ACTION.  This avoids wasting an LLM call
+        #    on a message that is just a repo name. ──
+        if event.thread_ts and self.action is not None:
+            pending_req = await self._check_pending_request(event)
+            if pending_req is not None:
+                logger.info(
+                    "Pending request found — skipping classification, routing to ACTION",
+                    extra={"channel": event.channel, "thread_ts": event.conversation_ts},
+                )
+                await self.action.run(
+                    ActionRequest(
+                        channel=event.channel or "",
+                        thread_ts=event.conversation_ts or "",
+                        request=event.prompt_text,
+                        user_id=event.user,
+                    )
+                )
+                return IntentClassification(intent=IntentType.ACTION, rationale="pending request fast-path")
+
         thread_messages = await self._load_thread_messages(event)
 
         try:
             classification = await self.classify(event, thread_messages)
         except Exception:
-            logger.exception(
-                "Intent classification failed",
+            logger.warning(
+                "Intent classification failed on first attempt; retrying",
                 extra={"channel": event.channel, "thread_ts": event.conversation_ts},
+                exc_info=True,
             )
-            await self._post_failure(event)
-            return None
+            try:
+                classification = await self.classify(event, thread_messages)
+            except Exception:
+                logger.warning(
+                    "Intent classification failed on retry; defaulting to ACTION",
+                    extra={"channel": event.channel, "thread_ts": event.conversation_ts},
+                    exc_info=True,
+                )
+                classification = IntentClassification(
+                    intent=IntentType.ACTION,
+                    rationale="classification failed — defaulting to ACTION",
+                )
 
         logger.info(
             "Slack intent classified",
@@ -161,12 +193,16 @@ class IntentWorkflow:
     def _build_prompt(self, event: SlackEvent, thread_messages: list[SlackThreadMessageRecord]) -> str:
         return (
             "You classify Slack bot mentions into exactly one intent.\n"
-            "Return JSON only with this exact schema: "
-            '{"intent":"QUESTION|ACTION|CONFIGURE","rationale":"brief explanation"}.\n'
-            "Use QUESTION when the user mainly wants an answer, explanation, summary, or clarification.\n"
-            "Use ACTION when the user wants code changes, file updates, a PR, or another task to be carried out.\n"
-            "Use CONFIGURE when the user wants to change, update, or switch the repository the bot is working with, "
-            "including changing the repo path, GitHub repository, or asking about the current configuration.\n\n"
+            "Return ONLY a JSON object. Pick exactly one intent value.\n"
+            'Example: {"intent":"ACTION","rationale":"User wants a code change."}\n\n'
+            "The intent field MUST be one of these three strings:\n"
+            '- "QUESTION" — the user wants an answer, explanation, summary, or clarification.\n'
+            '- "ACTION" — the user wants code changes, file updates, a PR, bug fixes, feature additions, '
+            "UI changes, refactors, or any other task that modifies source code. "
+            "Examples: 'change the color scheme', 'add a login page', 'fix the bug in checkout'.\n"
+            '- "CONFIGURE" — the user explicitly wants to change which GitHub repository the bot '
+            "targets (e.g. 'switch to org/other-repo', 'use repo X'). "
+            "Do NOT use CONFIGURE for requests that change application code or behavior.\n\n"
             f"Current message:\n{event.prompt_text}\n\n"
             f"Recent thread context:\n{self._format_thread_context(thread_messages)}"
         )
@@ -183,11 +219,14 @@ class IntentWorkflow:
     @staticmethod
     def _parse_classification(raw_content: str) -> IntentClassification:
         candidate = raw_content.strip()
+        logger.debug("Raw classification LLM response: %s", candidate)
         if not candidate.startswith("{"):
             start = candidate.find("{")
             end = candidate.rfind("}")
             if start == -1 or end == -1 or end <= start:
-                raise ValueError("LLM response did not contain a JSON object")
+                raise ValueError(
+                    f"LLM response did not contain a JSON object: {candidate[:200]}"
+                )
             candidate = candidate[start : end + 1]
 
         try:
@@ -231,6 +270,17 @@ class IntentWorkflow:
     # ------------------------------------------------------------------
     # Edit-spec loop helpers
     # ------------------------------------------------------------------
+
+    async def _check_pending_request(self, event: SlackEvent) -> str | None:
+        """Check if this thread has a pending request from a repo clarification."""
+        try:
+            return await self.supabase.get_pending_request(
+                channel_id=event.channel or "",
+                thread_ts=event.conversation_ts or "",
+            )
+        except Exception:
+            logger.warning("Failed to check for pending request", exc_info=True)
+            return None
 
     async def _check_pending_execution(self, event: SlackEvent) -> ActionExecution | None:
         """Check if this thread has a pending action execution."""

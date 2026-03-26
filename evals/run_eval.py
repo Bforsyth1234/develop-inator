@@ -67,6 +67,9 @@ class _NoOpSlack:
     async def post_message(self, channel: str, text: str, thread_ts: str | None = None) -> None:
         pass
 
+    async def post_blocks(self, channel: str, blocks: list, text: str = "", thread_ts: str | None = None) -> None:
+        pass
+
 
 class _NoOpGit:
     """Git stub — records the PR draft but does not call GitHub."""
@@ -80,9 +83,9 @@ class _NoOpGit:
 
 _CATEGORY_TO_TIER: dict[str, str] = {
     "bugfix": "simple",
-    "feature": "complex",
-    "refactor": "complex",
-    "performance": "complex",
+    "feature": "simple",
+    "refactor": "simple",
+    "performance": "simple",
 }
 
 
@@ -215,6 +218,9 @@ async def _run_single_task(task_entry: dict, keep_dirs: bool = False, aider_bin:
         git = _NoOpGit()
         llm = _BypassLLM(task_text, category=category)
 
+        # The bare origin created by _prepare_repo lives alongside work_dir.
+        bare_dir = os.path.join(work_dir, "..", "origin.git")
+
         workflow = ActionWorkflow(
             slack=slack,
             git=git,
@@ -222,7 +228,12 @@ async def _run_single_task(task_entry: dict, keep_dirs: bool = False, aider_bin:
             repo_map=["eval/dummy-react-app"],
             supabase=None,
             aider_bin=aider_bin,
+            github_token="eval-token",
         )
+
+        # Monkey-patch _build_clone_url so the workflow clones from the local
+        # bare repo instead of trying to reach GitHub.
+        workflow._build_clone_url = lambda repository: os.path.abspath(bare_dir)
 
         request = ActionRequest(
             channel="eval-channel",
@@ -244,9 +255,12 @@ async def _run_single_task(task_entry: dict, keep_dirs: bool = False, aider_bin:
             result.error = f"Workflow status={route_result.status}: {route_result.message[:500]}"
             return result
 
-        # Checkout the branch to verify tests & lint
+        # Fetch from the bare origin and checkout the branch to verify tests & lint.
+        # The workflow pushed to origin from its own ephemeral clone, so the
+        # eval's work_dir must fetch first to see the new branch.
         branch = route_result.branch_name
         if branch:
+            _run(["git", "fetch", "origin"], cwd=work_dir)
             _run(["git", "checkout", branch], cwd=work_dir)
 
         # Check 2: Tests pass

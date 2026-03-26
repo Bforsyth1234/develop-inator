@@ -22,7 +22,7 @@ from slack_bot_backend.models.action import (
     EvaluationResult,
 )
 from slack_bot_backend.models.persistence import ActivePullRequestRecord
-from slack_bot_backend.services.interfaces import LanguageModel, PullRequestDraft, SlackGateway, SupabaseRepository
+from slack_bot_backend.services.interfaces import ContextSearch, LanguageModel, PullRequestDraft, SlackGateway, SupabaseRepository
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +174,7 @@ class ActionWorkflow:
         supabase: SupabaseRepository | None = None,
         model_tier_map: dict[str, str] | None = None,
         aider_bin: str | None = None,
+        context_search: ContextSearch | None = None,
     ) -> None:
         self.slack = slack
         self.git = git
@@ -183,6 +184,7 @@ class ActionWorkflow:
         self.supabase = supabase
         self.model_tier_map: dict[str, str] = dict(model_tier_map or _MODEL_TIER_MAP)
         self.aider_bin = aider_bin
+        self.context_search = context_search
         # Per-branch locks to serialize concurrent Aider runs.
         # When multiple review comments arrive at the same time for the
         # same branch, only one Aider process runs at a time; the rest queue.
@@ -203,6 +205,18 @@ class ActionWorkflow:
         target = eval_result.target_repository
         if target and target in self.repo_map:
             return target
+        return None
+
+    def _extract_repo_from_message(self, text: str) -> str | None:
+        """Check if the user's message text contains a valid repo from ``repo_map``.
+
+        This handles the case where the user replies with just a repo name
+        (e.g. ``Bforsyth1234/rfpinator``) after a "which repository?" clarification.
+        """
+        stripped = text.strip()
+        for repo_key in self.repo_map:
+            if repo_key == stripped or repo_key in stripped:
+                return repo_key
         return None
 
     async def _get_active_thread_repo(self, request: ActionRequest) -> str | None:
@@ -243,10 +257,109 @@ class ActionWorkflow:
                 exc_info=True,
             )
 
+    async def _save_pending_request(self, request: ActionRequest) -> None:
+        """Save the original user request so it can be re-executed after repo clarification."""
+        if self.supabase is None:
+            return
+        try:
+            await self.supabase.save_pending_request(
+                channel_id=request.channel,
+                thread_ts=request.thread_ts,
+                pending_request=request.request,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to save pending request",
+                extra={"channel": request.channel, "thread_ts": request.thread_ts},
+                exc_info=True,
+            )
+
+    async def _get_pending_request(self, request: ActionRequest) -> str | None:
+        """Retrieve a stored pending request for this thread, if any."""
+        if self.supabase is None:
+            return None
+        try:
+            return await self.supabase.get_pending_request(
+                channel_id=request.channel,
+                thread_ts=request.thread_ts,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to read pending request",
+                extra={"channel": request.channel, "thread_ts": request.thread_ts},
+                exc_info=True,
+            )
+            return None
+
+    async def _clear_pending_request(self, request: ActionRequest) -> None:
+        """Clear the stored pending request after successful re-execution."""
+        if self.supabase is None:
+            return
+        try:
+            await self.supabase.clear_pending_request(
+                channel_id=request.channel,
+                thread_ts=request.thread_ts,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to clear pending request",
+                extra={"channel": request.channel, "thread_ts": request.thread_ts},
+                exc_info=True,
+            )
+
     async def run(self, request: ActionRequest) -> ActionRouteResult:
         try:
             # ── Pre-flight: fetch remembered thread context ──
             active_thread_repo = await self._get_active_thread_repo(request)
+            logger.info(
+                "ACTION run: channel=%s thread_ts=%s active_thread_repo=%s repo_map=%s",
+                request.channel, request.thread_ts, active_thread_repo, self.repo_map,
+            )
+
+            # ── Repo-name reply detection ──
+            # If the thread has no saved repo yet, check whether the user's
+            # message is simply a repository name (a reply to "which repo?").
+            # If so, persist it as the thread context and check for a stored
+            # pending request to auto re-execute.
+            if active_thread_repo is None and self.repo_map:
+                matched_repo = self._extract_repo_from_message(request.request)
+                logger.info("Repo-name extraction: request=%r matched=%s", request.request, matched_repo)
+                if matched_repo is not None:
+                    await self._save_thread_context(request, matched_repo)
+
+                    # Check if there's a pending request to re-execute
+                    pending = await self._get_pending_request(request)
+                    if pending is not None:
+                        logger.info(
+                            "Re-executing pending request: %r with repo=%s",
+                            pending, matched_repo,
+                        )
+                        await self._clear_pending_request(request)
+                        await self._post_message(
+                            request,
+                            f":white_check_mark: Got it — targeting `{matched_repo}`. "
+                            f"Now executing your original request…",
+                        )
+                        # Re-invoke run() with the original request and the
+                        # now-known thread context.
+                        replay_request = ActionRequest(
+                            channel=request.channel,
+                            thread_ts=request.thread_ts,
+                            request=pending,
+                        )
+                        return await self.run(replay_request)
+
+                    # No pending request — just confirm the repo selection
+                    message = (
+                        f":white_check_mark: Got it — I'll target `{matched_repo}` "
+                        "for this thread. What would you like me to do?"
+                    )
+                    await self._post_message(request, message)
+                    return ActionRouteResult(
+                        status="repo_selected",
+                        provider="system",
+                        message=message,
+                    )
 
             eval_result = await self._evaluate_request(
                 request, active_thread_repo=active_thread_repo,
@@ -258,8 +371,20 @@ class ActionWorkflow:
             target_repo_key: str | None = None
             if self.repo_map:
                 target_repo_key = self._resolve_target_repository(eval_result)
+                # Fall back to the thread-level memory if the evaluator
+                # didn't return a valid repository (e.g. user already
+                # clarified in a previous message).
+                if target_repo_key is None and active_thread_repo is not None:
+                    logger.info(
+                        "Evaluator did not specify target repo; using thread context: %s",
+                        active_thread_repo,
+                    )
+                    target_repo_key = active_thread_repo
                 if target_repo_key is None:
-                    # LLM didn't pick a valid repo — ask the user
+                    # Neither the evaluator nor thread context provided a repo.
+                    # Save the original request so we can auto re-execute it
+                    # once the user tells us which repo to target.
+                    await self._save_pending_request(request)
                     repo_list = ", ".join(f"`{k}`" for k in self.repo_map)
                     message = (
                         ":thinking_face: I couldn't determine which repository "
@@ -352,6 +477,47 @@ class ActionWorkflow:
         thread_ts = mapping.thread_ts
         branch_name = mapping.branch_name
 
+        # Extract "owner/repo" from the PR URL so we can clone the right repo.
+        # PR URLs look like https://github.com/owner/repo/pull/123
+        target_repo_key = self._repo_key_from_pr_url(pr_url)
+
+        # Fallback: if the URL didn't parse, try the single-repo shortcut or
+        # the thread-level memory (mirrors the fallback logic in run()).
+        if target_repo_key is None:
+            logger.warning(
+                "Could not extract repo key from PR URL; attempting fallback",
+                extra={"pr_url": pr_url},
+            )
+            if len(self.repo_map) == 1:
+                target_repo_key = self.repo_map[0]
+            else:
+                # Try thread context as a last resort
+                _thread_repo = await self._get_active_thread_repo(
+                    ActionRequest(
+                        channel=channel_id,
+                        thread_ts=thread_ts,
+                        request=comment_body,
+                    )
+                )
+                if _thread_repo is not None:
+                    target_repo_key = _thread_repo
+
+        if target_repo_key is None:
+            logger.error(
+                "Cannot determine target repository for PR comment",
+                extra={"pr_url": pr_url},
+            )
+            try:
+                await self.slack.post_message(
+                    channel_id,
+                    ":x: I couldn't determine which repository this PR belongs to. "
+                    "Please check the bot configuration.",
+                    thread_ts=thread_ts,
+                )
+            except Exception:
+                logger.warning("Failed to post error to Slack", exc_info=True)
+            return
+
         # 2. Notify Slack thread
         comment_excerpt = comment_body[:200] + ("…" if len(comment_body) > 200 else "")
         try:
@@ -413,6 +579,7 @@ class ActionWorkflow:
                     optimized_prompt=optimized_prompt,
                     model=selected_model,
                     existing_branch=branch_name,
+                    target_repo_key=target_repo_key,
                 )
             except Exception:
                 logger.exception("Aider run failed for PR comment feedback")
@@ -734,11 +901,69 @@ class ActionWorkflow:
 
     _MAX_TEST_ATTEMPTS = 3
 
+    def _detect_install_command(self, work_dir: str | None = None) -> list[str] | None:
+        """Detect the dependency-install command for the repository."""
+        repo = Path(work_dir or os.getcwd())
+        if (repo / "pnpm-lock.yaml").exists():
+            return ["pnpm", "install", "--frozen-lockfile"]
+        if (repo / "yarn.lock").exists():
+            return ["yarn", "install", "--frozen-lockfile"]
+        if (repo / "package-lock.json").exists() or (repo / "package.json").exists():
+            return ["npm", "ci"]
+        if (repo / "requirements.txt").exists():
+            return ["pip", "install", "-r", "requirements.txt"]
+        return None
+
+    _INSTALL_TIMEOUT = 300  # 5 minutes
+
+    async def _install_dependencies(
+        self, env: dict[str, str], *, cwd: str | None = None,
+    ) -> subprocess.CompletedProcess[str] | None:
+        """Install project dependencies if a known package manager is detected.
+
+        Returns the completed process, or *None* if no install command was detected.
+        """
+        work_dir = cwd or os.getcwd()
+        install_cmd = self._detect_install_command(work_dir)
+        if install_cmd is None:
+            return None
+        logger.info("Installing dependencies: %s (cwd=%s)", install_cmd, work_dir)
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                install_cmd,
+                capture_output=True,
+                text=True,
+                cwd=work_dir,
+                env=env,
+                timeout=self._INSTALL_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            logger.error("Dependency install timed out after %ds: %s", self._INSTALL_TIMEOUT, install_cmd)
+            return subprocess.CompletedProcess(
+                args=install_cmd,
+                returncode=1,
+                stdout="",
+                stderr=f"[bot] Dependency install timed out after {self._INSTALL_TIMEOUT}s",
+            )
+        if result.returncode != 0:
+            logger.warning(
+                "Dependency install failed (exit %d): %s",
+                result.returncode, result.stderr[-500:],
+            )
+        else:
+            logger.info("Dependencies installed successfully")
+        return result
+
     def _detect_test_command(self, work_dir: str | None = None) -> list[str] | None:
         """Detect the test command for the repository. Returns None if unknown."""
         repo = Path(work_dir or os.getcwd())
-        # Node / npm projects
+        # Node / npm projects — prefer the lockfile-specific runner
         if (repo / "package.json").exists():
+            if (repo / "pnpm-lock.yaml").exists():
+                return ["pnpm", "test"]
+            if (repo / "yarn.lock").exists():
+                return ["yarn", "test"]
             return ["npm", "test"]
         # Python / pytest projects
         if (repo / "pytest.ini").exists():
@@ -778,6 +1003,22 @@ class ActionWorkflow:
                 stdout="",
                 stderr=f"[bot] Test command timed out after {self._TEST_TIMEOUT}s",
             )
+
+    @staticmethod
+    def _repo_key_from_pr_url(pr_url: str) -> str | None:
+        """Extract ``owner/repo`` from a GitHub PR URL.
+
+        Expected format: ``https://github.com/owner/repo/pull/123``
+        Returns ``None`` if the URL doesn't match the expected pattern.
+        """
+        # e.g. ['', 'owner', 'repo', 'pull', '123']
+        parts = pr_url.rstrip("/").split("github.com/")
+        if len(parts) < 2:
+            return None
+        segments = parts[1].split("/")
+        if len(segments) >= 2:
+            return f"{segments[0]}/{segments[1]}"
+        return None
 
     def _build_clone_url(self, repository: str) -> str:
         """Build a GitHub clone URL using the ``x-access-token`` scheme.
@@ -892,7 +1133,34 @@ class ActionWorkflow:
                     returncode=checkout_proc.returncode,
                 )
 
-        # 2. Run Aider non-interactively with the routed model
+        # 2. Discover relevant files via context search (OpenViking)
+        file_args: list[str] = []
+        if self.context_search is not None:
+            try:
+                matches = await self.context_search.match_chunks(
+                    [],
+                    query_text=optimized_prompt,
+                    limit=8,
+                )
+                for m in matches:
+                    # Extract relative file path from the URI or path field
+                    raw = m.path or ""
+                    # viking://resources/owner/repo/path/to/file → path/to/file
+                    parts = raw.split("/", 5)  # ['viking:', '', 'resources', 'owner', 'repo', 'rest']
+                    rel = parts[5] if len(parts) > 5 else raw.rsplit("/", 1)[-1]
+                    if rel:
+                        full = os.path.join(work_dir, rel)
+                        if os.path.isfile(full):
+                            file_args.append(rel)
+                logger.info(
+                    "Context search found %d candidate files, %d exist on disk",
+                    len(matches),
+                    len(file_args),
+                )
+            except Exception:
+                logger.warning("Context search failed; Aider will use repo map only", exc_info=True)
+
+        # 2b. Run Aider non-interactively with the routed model
         if self.aider_bin:
             aider_bin = self.aider_bin
         else:
@@ -902,8 +1170,10 @@ class ActionWorkflow:
             aider_bin,
             "--model", model,
             "--yes-always",
+            "--no-auto-commits",
             "--no-show-model-warnings",
             "--message", optimized_prompt,
+            *file_args,
         ]
         logger.info(
             "Launching Aider subprocess",
@@ -940,15 +1210,21 @@ class ActionWorkflow:
             self._sanitise_output(aider_proc.stdout[-3000:]) if aider_proc.stdout else "(empty)",
             self._sanitise_output(aider_proc.stderr[-3000:]) if aider_proc.stderr else "(empty)",
         )
+        # With --no-auto-commits, Aider leaves changes uncommitted.
+        # Check for either new commits OR a dirty working tree.
         current_sha_proc = await self._git("rev-parse", "HEAD", cwd=work_dir)
         current_sha = current_sha_proc.stdout.strip()
         aider_made_commits = current_sha != base_sha
 
-        if aider_proc.returncode != 0 or not aider_made_commits:
+        # Check for uncommitted changes (staged or unstaged)
+        diff_proc = await self._git("status", "--porcelain", cwd=work_dir)
+        has_uncommitted = bool(diff_proc.stdout.strip())
+
+        if aider_proc.returncode != 0 or (not aider_made_commits and not has_uncommitted):
             reason = (
                 f"exit {aider_proc.returncode}"
                 if aider_proc.returncode != 0
-                else "no commits produced"
+                else "no changes produced"
             )
             logger.warning(
                 "Aider run unsuccessful (%s); ephemeral workspace will be cleaned up",
@@ -959,12 +1235,24 @@ class ActionWorkflow:
                 branch_name=branch_name,
                 stdout=aider_proc.stdout,
                 stderr=aider_proc.stderr + (
-                    "\n[bot] Aider made no changes." if not aider_made_commits else ""
+                    "\n[bot] Aider made no changes." if not aider_made_commits and not has_uncommitted else ""
                 ),
                 returncode=aider_proc.returncode or 1,
             )
 
-        # 3. Run test validation loop (if a test framework is detected)
+        # Commit any uncommitted changes left by Aider (--no-auto-commits mode)
+        if has_uncommitted:
+            await self._git("add", "-A", cwd=work_dir)
+            await self._git(
+                "commit", "-m", f"feat: {optimized_prompt[:72]}",
+                cwd=work_dir,
+            )
+            logger.info("Committed Aider's uncommitted changes", extra={"branch": branch_name})
+
+        # 3. Install dependencies (so test runners like jest/pnpm are available)
+        await self._install_dependencies(subprocess_env, cwd=work_dir)
+
+        # 4. Run test validation loop (if a test framework is detected)
         test_cmd = self._detect_test_command(work_dir)
         test_attempts = 0
         last_test_output = ""

@@ -481,6 +481,43 @@ class ActionWorkflow:
         # PR URLs look like https://github.com/owner/repo/pull/123
         target_repo_key = self._repo_key_from_pr_url(pr_url)
 
+        # Fallback: if the URL didn't parse, try the single-repo shortcut or
+        # the thread-level memory (mirrors the fallback logic in run()).
+        if target_repo_key is None:
+            logger.warning(
+                "Could not extract repo key from PR URL; attempting fallback",
+                extra={"pr_url": pr_url},
+            )
+            if len(self.repo_map) == 1:
+                target_repo_key = self.repo_map[0]
+            else:
+                # Try thread context as a last resort
+                _thread_repo = await self._get_active_thread_repo(
+                    ActionRequest(
+                        channel=channel_id,
+                        thread_ts=thread_ts,
+                        request=comment_body,
+                    )
+                )
+                if _thread_repo is not None:
+                    target_repo_key = _thread_repo
+
+        if target_repo_key is None:
+            logger.error(
+                "Cannot determine target repository for PR comment",
+                extra={"pr_url": pr_url},
+            )
+            try:
+                await self.slack.post_message(
+                    channel_id,
+                    ":x: I couldn't determine which repository this PR belongs to. "
+                    "Please check the bot configuration.",
+                    thread_ts=thread_ts,
+                )
+            except Exception:
+                logger.warning("Failed to post error to Slack", exc_info=True)
+            return
+
         # 2. Notify Slack thread
         comment_excerpt = comment_body[:200] + ("…" if len(comment_body) > 200 else "")
         try:

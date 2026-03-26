@@ -91,6 +91,13 @@ class Settings(BaseModel):
     aider_model_simple: str = "anthropic/claude-sonnet-4-20250514"
     aider_model_complex: str = "anthropic/claude-opus-4-20250514"
 
+    # OpenHands execution — when enabled, complex tasks are routed to the
+    # OpenHands Cloud API instead of the manual Planner approval flow.
+    openhands_enabled: bool = False
+    openhands_model: str = "anthropic/claude-3-5-sonnet-20241022"
+    openhands_url: str = "https://app.all-hands.dev"
+    openhands_api_key: str | None = Field(default=None, repr=False)
+
     @model_validator(mode="after")
     def validate_provider_requirements(self) -> "Settings":
         if self.slack_enabled and not self.slack_bot_token:
@@ -158,6 +165,10 @@ class Settings(BaseModel):
             "openviking_api_key": source.get("SLACK_BOT_OPENVIKING_API_KEY"),
             "aider_model_simple": source.get("AIDER_MODEL_SIMPLE"),
             "aider_model_complex": source.get("AIDER_MODEL_COMPLEX"),
+            "openhands_enabled": source.get("SLACK_BOT_OPENHANDS_ENABLED"),
+            "openhands_model": source.get("SLACK_BOT_OPENHANDS_MODEL"),
+            "openhands_url": source.get("SLACK_BOT_OPENHANDS_URL"),
+            "openhands_api_key": source.get("SLACK_BOT_OPENHANDS_API_KEY"),
         }
         values = {key: value for key, value in raw_values.items() if value is not None}
         return cls.model_validate(values)

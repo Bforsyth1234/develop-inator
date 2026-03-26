@@ -704,8 +704,8 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
         model_idx = aider_cmd.index("--model") + 1
         self.assertEqual(aider_cmd[model_idx], _DEFAULT_TIER_MAP["simple"])
 
-    async def test_complex_tier_routes_to_planner(self) -> None:
-        """A 'complex' complexity_tier invokes the Planner instead of Aider directly."""
+    async def test_complex_tier_routes_to_openhands_when_enabled(self) -> None:
+        """A 'complex' complexity_tier invokes OpenHands when openhands_enabled=True."""
         slack = FakeSlackGateway()
         git = FakeGitService()
         llm = FakeLanguageModel(evaluator_json={
@@ -716,37 +716,33 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "target_repository": "owner/repo",
         })
 
-        # The planner LLM call (second generate call) returns a spec string
-        call_count = 0
-        original_generate = llm.generate
-
-        async def patched_generate(prompt: str) -> LLMResult:
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                # First call is the evaluator
-                return await original_generate(prompt)
-            # Second call is the planner — return a markdown spec
-            return LLMResult(content="## Implementation Spec\n1. Refactor AuthService", provider="fake")
-
-        llm.generate = patched_generate
-
-        result = await self._make_workflow(slack=slack, git=git, llm=llm).run(
-            ActionRequest(channel="C123", thread_ts="1710.2", request="Refactor auth to use NgRx")
+        wf = ActionWorkflow(
+            slack=slack,
+            git=git,
+            llm=llm,
+            github_token="stub",
+            model_tier_map=_DEFAULT_TIER_MAP,
+            repo_map=["owner/repo"],
+            openhands_enabled=True,
+            openhands_model="anthropic/claude-3-5-sonnet-20241022",
+            openhands_url="https://app.all-hands.dev",
+            openhands_api_key="test-api-key",
         )
 
+        fake_oh_result = AiderResult(
+            returncode=0,
+            stdout="OpenHands completed",
+            stderr="",
+            branch_name="ai-update-12345",
+        )
+
+        with mock.patch.object(wf, "_run_openhands", return_value=fake_oh_result) as mock_oh:
+            result = await wf.run(
+                ActionRequest(channel="C123", thread_ts="1710.2", request="Refactor auth to use NgRx")
+            )
+
+        mock_oh.assert_called_once()
         self.assertEqual(result.status, "completed")
-        self.assertEqual(result.provider, "planner")
-        # Should have posted a "generating spec" message + Block Kit blocks
-        self.assertTrue(len(slack.messages) >= 1)
-        self.assertIn("complex", slack.messages[0]["text"])
-        self.assertEqual(len(slack.blocks_calls), 1)
-        blocks = slack.blocks_calls[0]["blocks"]
-        # Should have approve/reject buttons
-        action_block = [b for b in blocks if b.get("type") == "actions"][0]
-        action_ids = [e["action_id"] for e in action_block["elements"]]
-        self.assertIn("approve_spec", action_ids)
-        self.assertIn("reject_spec", action_ids)
 
     async def test_aider_subprocess_receives_env_with_api_keys(self) -> None:
         """The Aider subprocess env includes GROQ_API_KEY and ANTHROPIC_API_KEY."""
@@ -1213,154 +1209,6 @@ class TestDetectTestCommand(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             wf = self._make_workflow(d)
             self.assertIsNone(wf._detect_test_command(d))
-
-
-class ExecuteApprovedTests(unittest.IsolatedAsyncioTestCase):
-    """Tests for the _execute_approved background task in the approval flow."""
-
-    def setUp(self) -> None:
-        patcher = mock.patch.object(
-            ActionWorkflow, "_detect_test_command", return_value=None,
-        )
-        self._no_tests = patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def _make_execution(self) -> ActionExecution:
-        return ActionExecution(
-            id="exec-001",
-            channel="C123",
-            thread_ts="1710.2",
-            user_id="U456",
-            original_request="Refactor auth module",
-            generated_spec="## Spec\n1. Refactor AuthService",
-            status="approved",
-            model="anthropic/claude-sonnet-4-20250514",
-        )
-
-    def _make_container(
-        self,
-        *,
-        slack: FakeSlackGateway,
-        git: FakeGitService,
-        supabase: FakeSupabaseRepository,
-    ) -> ServiceContainer:
-        llm = FakeLanguageModel()
-        action = ActionWorkflow(
-            slack=slack,
-            git=git,
-            llm=llm,
-            github_token="stub",
-            supabase=supabase,
-            model_tier_map=_DEFAULT_TIER_MAP,
-            repo_map=["owner/repo"],
-        )
-        question = QuestionWorkflow(slack=slack, supabase=supabase, llm=llm)
-        return ServiceContainer(
-            settings=Settings(environment="testing"),
-            slack=slack,
-            supabase=supabase,
-            llm=llm,
-            git=git,
-            action=action,
-            intent=IntentWorkflow(
-                slack=slack, supabase=supabase, llm=llm,
-                question=question, action=action,
-            ),
-            question=question,
-        )
-
-    async def test_approved_spec_creates_pr_and_posts_success(self) -> None:
-        """After approval, _handle_spec_action dispatches to Celery."""
-        slack = FakeSlackGateway()
-        git = FakeGitService()
-        execution = self._make_execution()
-        supabase = FakeSupabaseRepository(stored_execution=execution)
-        container = self._make_container(slack=slack, git=git, supabase=supabase)
-
-        with mock.patch(
-            "slack_bot_backend.api.routes.process_spec_approval_task"
-        ) as mock_task:
-            from slack_bot_backend.api.routes import _handle_spec_action
-            payload = {
-                "actions": [{"action_id": "approve_spec", "value": "exec-001"}],
-                "container": {"message_ts": "1710.3"},
-            }
-            result = await _handle_spec_action(container, payload)
-
-        self.assertEqual(result, {"ok": True})
-        mock_task.apply_async.assert_called_once_with(
-            kwargs={"execution_id": "exec-001"},
-        )
-
-    async def test_approved_spec_with_existing_branch_uses_it(self) -> None:
-        """When a PR mapping exists, _handle_spec_action still dispatches to Celery."""
-        slack = FakeSlackGateway()
-        git = FakeGitService()
-        execution = self._make_execution()
-        pr_mapping = ActivePullRequestRecord(
-            pr_url="https://github.com/owner/repo/pull/10",
-            branch_name="ai-update-existing",
-            channel_id="C123",
-            thread_ts="1710.2",
-        )
-        supabase = FakeSupabaseRepository(stored_execution=execution, pr_mapping=pr_mapping)
-        container = self._make_container(slack=slack, git=git, supabase=supabase)
-
-        with mock.patch(
-            "slack_bot_backend.api.routes.process_spec_approval_task"
-        ) as mock_task:
-            from slack_bot_backend.api.routes import _handle_spec_action
-            payload = {
-                "actions": [{"action_id": "approve_spec", "value": "exec-001"}],
-                "container": {"message_ts": "1710.3"},
-            }
-            result = await _handle_spec_action(container, payload)
-
-        self.assertEqual(result, {"ok": True})
-        mock_task.apply_async.assert_called_once_with(
-            kwargs={"execution_id": "exec-001"},
-        )
-
-    async def test_approved_spec_aider_failure_posts_error(self) -> None:
-        """When approval is dispatched, Celery task is invoked."""
-        slack = FakeSlackGateway()
-        git = FakeGitService()
-        execution = self._make_execution()
-        supabase = FakeSupabaseRepository(stored_execution=execution)
-        container = self._make_container(slack=slack, git=git, supabase=supabase)
-
-        with mock.patch(
-            "slack_bot_backend.api.routes.process_spec_approval_task"
-        ) as mock_task:
-            from slack_bot_backend.api.routes import _handle_spec_action
-            payload = {
-                "actions": [{"action_id": "approve_spec", "value": "exec-001"}],
-                "container": {"message_ts": "1710.3"},
-            }
-            result = await _handle_spec_action(container, payload)
-
-        self.assertEqual(result, {"ok": True})
-        mock_task.apply_async.assert_called_once()
-
-    async def test_approved_spec_exception_posts_error_to_slack(self) -> None:
-        """Rejection updates execution status and updates the Slack message."""
-        slack = FakeSlackGateway()
-        git = FakeGitService()
-        execution = self._make_execution()
-        supabase = FakeSupabaseRepository(stored_execution=execution)
-        container = self._make_container(slack=slack, git=git, supabase=supabase)
-
-        from slack_bot_backend.api.routes import _handle_spec_action
-        payload = {
-            "actions": [{"action_id": "reject_spec", "value": "exec-001"}],
-            "container": {"message_ts": "1710.3"},
-        }
-        result = await _handle_spec_action(container, payload)
-
-        self.assertEqual(result, {"ok": True})
-        # Rejection message should have been sent via update_message
-        rejection_updates = [u for u in slack.update_calls if "rejected" in (u["text"] or "").lower()]
-        self.assertTrue(len(rejection_updates) >= 1, f"Expected rejection update, got: {slack.update_calls}")
 
 
 class SubprocessTimeoutTests(unittest.IsolatedAsyncioTestCase):

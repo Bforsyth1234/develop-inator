@@ -268,6 +268,10 @@ def _build_action_workflow(
             "complex": settings.aider_model_complex,
         },
         context_search=context_search,
+        openhands_enabled=settings.openhands_enabled,
+        openhands_model=settings.openhands_model,
+        openhands_url=settings.openhands_url,
+        openhands_api_key=settings.openhands_api_key,
     )
 
 

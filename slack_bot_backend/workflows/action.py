@@ -744,7 +744,8 @@ class ActionWorkflow:
 
         await self._post_message(
             request,
-            ":brain: This looks like a complex change — running OpenHands agent…",
+            ":brain: This looks like a complex change — running OpenHands agent. "
+            "This may take a while (especially on first run). I'll post updates as it progresses.",
         )
 
         repository = target_repo_key or (self.repo_map[0] if self.repo_map else None)
@@ -766,8 +767,59 @@ class ActionWorkflow:
             "repository": repository,
         }
 
+        if not self.github_token:
+            return AiderResult(
+                branch_name=branch_name,
+                stdout="",
+                stderr=(
+                    "OpenHands requires a GitHub token to access repositories "
+                    "(set SLACK_BOT_GITHUB_TOKEN)"
+                ),
+                returncode=1,
+            )
+
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+                # 0. Register the GitHub token so OpenHands can access the repo.
+                #    The V0 ``/api/conversations`` endpoint reads provider tokens
+                #    from OpenHands' secrets store via ``get_provider_tokens``.
+                #    Without this step the server raises:
+                #      TypeError: provider_tokens must be a MappingProxyType, got NoneType
+                provider_payload = {
+                    "provider_tokens": {
+                        "github": {
+                            "token": self.github_token,
+                            "host": "github.com",
+                        },
+                    },
+                }
+                logger.info(
+                    "Registering GitHub token with OpenHands at %s/api/add-git-providers",
+                    self.openhands_url,
+                )
+                token_resp = await client.post(
+                    f"{self.openhands_url}/api/add-git-providers",
+                    headers=headers,
+                    json=provider_payload,
+                )
+                if token_resp.status_code != 200:
+                    logger.error(
+                        "OpenHands add-git-providers failed (HTTP %s): %s",
+                        token_resp.status_code, token_resp.text,
+                    )
+                    return AiderResult(
+                        branch_name=branch_name,
+                        stdout="",
+                        stderr=(
+                            f"Failed to register GitHub token with OpenHands "
+                            f"(HTTP {token_resp.status_code}): {token_resp.text}. "
+                            f"The token may be invalid or OpenHands cannot reach "
+                            f"GitHub to validate it."
+                        ),
+                        returncode=1,
+                    )
+                logger.info("Registered GitHub token with OpenHands successfully")
+
                 # 1. Start the conversation
                 resp = await client.post(
                     f"{self.openhands_url}/api/conversations",
@@ -786,12 +838,16 @@ class ActionWorkflow:
                     "OpenHands conversation started: %s", conversation_id,
                 )
 
-                # 2. Poll for completion (max ~30 min with 15s intervals)
-                max_polls = 120
+                # 2. Poll for completion (max ~60 min with 15s intervals)
+                max_polls = 240
                 poll_interval = 15
                 final_status = "UNKNOWN"
+                # Post a Slack update every ~5 minutes so the user knows
+                # the agent is still working.
+                polls_between_updates = 20  # 20 × 15s = 5 min
+                last_reported_status: str | None = None
 
-                for _ in range(max_polls):
+                for poll_num in range(1, max_polls + 1):
                     await asyncio.sleep(poll_interval)
 
                     status_resp = await client.get(
@@ -809,6 +865,19 @@ class ActionWorkflow:
 
                     if final_status in ("STOPPED", "ERROR"):
                         break
+
+                    # Post periodic "still working" updates to Slack
+                    if (
+                        poll_num % polls_between_updates == 0
+                        and final_status != last_reported_status
+                    ):
+                        elapsed_min = (poll_num * poll_interval) // 60
+                        await self._post_message(
+                            request,
+                            f":hourglass_flowing_sand: OpenHands is still working "
+                            f"(status: *{final_status}*, ~{elapsed_min} min elapsed)…",
+                        )
+                        last_reported_status = final_status
 
             conversation_link = (
                 f"{self.openhands_url}/conversations/{conversation_id}"
@@ -832,6 +901,21 @@ class ActionWorkflow:
                     returncode=1,
                 )
 
+        except httpx.TimeoutException as exc:
+            logger.exception(
+                "OpenHands API call timed out",
+                extra={"channel": request.channel, "thread_ts": request.thread_ts},
+            )
+            return AiderResult(
+                branch_name=branch_name,
+                stdout="",
+                stderr=(
+                    f"OpenHands request timed out: {exc}. "
+                    "If this is the first run, the sandbox image may still be building. "
+                    "Please try again in a few minutes."
+                ),
+                returncode=1,
+            )
         except Exception as exc:
             logger.exception(
                 "OpenHands API call failed",
@@ -840,7 +924,7 @@ class ActionWorkflow:
             return AiderResult(
                 branch_name=branch_name,
                 stdout="",
-                stderr=f"OpenHands execution failed: {exc}",
+                stderr=f"OpenHands execution failed: {type(exc).__name__}: {exc}",
                 returncode=1,
             )
 

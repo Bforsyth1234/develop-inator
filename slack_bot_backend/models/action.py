@@ -79,7 +79,7 @@ class EvaluationResult(BaseModel):
     is_actionable: bool
     clarifying_question: str | None = None
     optimized_prompt: str | None = None
-    complexity_tier: Literal["simple", "complex"] = "simple"
+    complexity_tier: Literal["trivial", "standard", "complex"] = "standard"
     target_repository: str | None = None
 
 

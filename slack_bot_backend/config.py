@@ -59,8 +59,8 @@ class Settings(BaseModel):
     # Routing LLM configuration (used when llm_provider = "router")
     groq_api_key: str | None = Field(default=None, repr=False)
     router_light_model: str = "groq/qwen/qwen3-32b"
-    router_standard_model: str = "anthropic/claude-sonnet-4-20250514"
-    router_heavy_model: str = "anthropic/claude-opus-4-20250514"
+    router_standard_model: str = "anthropic/claude-sonnet-4-6"
+    router_heavy_model: str = "anthropic/claude-opus-4-6"
 
     git_provider: GitProvider = GitProvider.STUB
     github_token: str | None = Field(default=None, repr=False)
@@ -85,11 +85,18 @@ class Settings(BaseModel):
     openviking_url: str | None = None
     openviking_api_key: str | None = Field(default=None, repr=False)
 
-    # Aider execution — both tiers default to Claude Sonnet because weaker
-    # models (e.g. Groq/Llama) can't reliably produce valid code edits in
-    # any of Aider's edit formats (diff, whole, udiff).
-    aider_model_simple: str = "anthropic/claude-sonnet-4-20250514"
-    aider_model_complex: str = "anthropic/claude-opus-4-20250514"
+    # Aider execution — three tiers: trivial uses Groq/Llama (fast/cheap),
+    # standard uses Claude Sonnet (reliable code edits), complex routes to
+    # OpenHands instead of Aider.
+    aider_model_trivial: str = "groq/llama-3.3-70b-versatile"
+    aider_model_standard: str = "anthropic/claude-sonnet-4-6"
+
+    # OpenHands execution — when enabled, complex tasks are routed to the
+    # OpenHands Cloud API instead of the manual Planner approval flow.
+    openhands_enabled: bool = False
+    openhands_model: str = "anthropic/claude-sonnet-4-6"
+    openhands_url: str = "https://app.all-hands.dev"
+    openhands_api_key: str | None = Field(default=None, repr=False)
 
     @model_validator(mode="after")
     def validate_provider_requirements(self) -> "Settings":
@@ -156,8 +163,12 @@ class Settings(BaseModel):
             "openviking_enabled": source.get("SLACK_BOT_OPENVIKING_ENABLED"),
             "openviking_url": source.get("SLACK_BOT_OPENVIKING_URL"),
             "openviking_api_key": source.get("SLACK_BOT_OPENVIKING_API_KEY"),
-            "aider_model_simple": source.get("AIDER_MODEL_SIMPLE"),
-            "aider_model_complex": source.get("AIDER_MODEL_COMPLEX"),
+            "aider_model_trivial": source.get("SLACK_BOT_AIDER_MODEL_TRIVIAL"),
+            "aider_model_standard": source.get("SLACK_BOT_AIDER_MODEL_STANDARD"),
+            "openhands_enabled": source.get("SLACK_BOT_OPENHANDS_ENABLED"),
+            "openhands_model": source.get("SLACK_BOT_OPENHANDS_MODEL"),
+            "openhands_url": source.get("SLACK_BOT_OPENHANDS_URL"),
+            "openhands_api_key": source.get("SLACK_BOT_OPENHANDS_API_KEY"),
         }
         values = {key: value for key, value in raw_values.items() if value is not None}
         return cls.model_validate(values)

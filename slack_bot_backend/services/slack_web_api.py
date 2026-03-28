@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 
 _SLACK_POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage"
 _SLACK_UPDATE_MESSAGE_URL = "https://slack.com/api/chat.update"
+_SLACK_CONVERSATIONS_REPLIES_URL = "https://slack.com/api/conversations.replies"
 
 
 class SlackWebAPIGateway:
@@ -83,4 +84,33 @@ class SlackWebAPIGateway:
 
         self._raise_for_slack(response.json(), method="chat.update", channel=channel, ts=ts)
         logger.info("Slack message updated", extra={"channel": channel, "ts": ts})
+
+    async def fetch_replies(
+        self,
+        channel: str,
+        thread_ts: str,
+        *,
+        oldest: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """Return messages in a thread via ``conversations.replies``."""
+        params: dict[str, str | int] = {
+            "channel": channel,
+            "ts": thread_ts,
+            "limit": limit,
+        }
+        if oldest is not None:
+            params["oldest"] = oldest
+
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            response = await client.get(
+                _SLACK_CONVERSATIONS_REPLIES_URL,
+                params=params,
+                headers=self._headers(),
+            )
+            response.raise_for_status()
+
+        body = response.json()
+        self._raise_for_slack(body, method="conversations.replies", channel=channel, thread_ts=thread_ts)
+        return body.get("messages", [])
 

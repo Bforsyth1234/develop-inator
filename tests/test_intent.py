@@ -37,6 +37,11 @@ class FakeSlackGateway:
     ) -> None:
         self.update_calls.append({"channel": channel, "ts": ts, "text": text, "blocks": blocks})
 
+    async def fetch_replies(
+        self, channel: str, thread_ts: str, *, oldest: str | None = None, limit: int = 100,
+    ) -> list[dict]:
+        return []
+
 
 class FakeContextSearch:
     def __init__(self, *, documents: list[DocumentationMatch] | None = None) -> None:

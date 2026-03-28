@@ -12,6 +12,7 @@ dependencies = [
   "celery>=5.6.2",
   "fastapi>=0.115,<1.0",
   "langgraph>=1.1.3",
+  "openhands>=0.0.0",
   "python-dotenv>=1.0,<2.0",
   "redis>=7.3.0",
   "tree-sitter>=0.25",
@@ -24,4 +25,14 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "httpx>=0.28,<1.0",
+]
+
+
+[tool.uv]
+# Pin litellm to avoid aider 0.86.2 crash:
+# litellm >=1.81.11 adds PermissionDeniedError which is missing from
+# aider's EXCEPTIONS list, causing ValueError on every run.
+# Remove this constraint once aider is updated past 0.86.2.
+constraint-dependencies = [
+  "litellm<1.81.11",
 ]

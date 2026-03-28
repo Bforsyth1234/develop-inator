@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
-import uuid
 from typing import Protocol
 
-from slack_bot_backend.models.action import ActionExecution, ActionRequest
+from slack_bot_backend.models.action import ActionRequest
 from slack_bot_backend.models.intent import IntentClassification, IntentType
 from slack_bot_backend.models.persistence import SlackThreadMessageRecord
 from slack_bot_backend.models.question import QuestionRequest
@@ -21,16 +20,6 @@ logger = logging.getLogger(__name__)
 
 class ActionRunner(Protocol):
     async def run(self, request: ActionRequest): ...
-
-    def _build_spec_blocks(self, spec: str, execution_id: str) -> list[dict]: ...
-
-    async def generate_revised_spec(
-        self,
-        *,
-        old_spec: str,
-        user_feedback: str,
-        original_request: str,
-    ) -> str: ...
 
 
 class IntentWorkflow:
@@ -145,14 +134,6 @@ class IntentWorkflow:
             return []
 
     async def _dispatch(self, event: SlackEvent, classification: IntentClassification) -> None:
-        # ── Edit-spec loop: if this thread has a pending execution, re-invoke
-        #    the planner with the user's feedback instead of normal dispatch. ──
-        if event.thread_ts and self.action is not None:
-            pending = await self._check_pending_execution(event)
-            if pending is not None:
-                await self._handle_spec_revision(event, pending)
-                return
-
         if classification.intent is IntentType.QUESTION and self.question is not None:
             await self.question.run(
                 QuestionRequest(
@@ -268,7 +249,7 @@ class IntentWorkflow:
             logger.exception("Failed to post Slack classification failure message")
 
     # ------------------------------------------------------------------
-    # Edit-spec loop helpers
+    # Helpers
     # ------------------------------------------------------------------
 
     async def _check_pending_request(self, event: SlackEvent) -> str | None:
@@ -281,76 +262,3 @@ class IntentWorkflow:
         except Exception:
             logger.warning("Failed to check for pending request", exc_info=True)
             return None
-
-    async def _check_pending_execution(self, event: SlackEvent) -> ActionExecution | None:
-        """Check if this thread has a pending action execution."""
-        try:
-            return await self.supabase.get_pending_execution_for_thread(
-                channel=event.channel or "",
-                thread_ts=event.thread_ts or "",
-            )
-        except Exception:
-            logger.warning("Failed to check for pending execution", exc_info=True)
-            return None
-
-    async def _handle_spec_revision(
-        self, event: SlackEvent, pending: ActionExecution,
-    ) -> None:
-        """Re-invoke the planner with the old spec + user feedback, post V2."""
-        assert self.action is not None
-
-        await self.slack.post_message(
-            event.channel or "",
-            ":arrows_counterclockwise: Revising the spec based on your feedback…",
-            thread_ts=event.conversation_ts,
-        )
-
-        try:
-            new_spec = await self.action.generate_revised_spec(
-                old_spec=pending.generated_spec,
-                user_feedback=event.prompt_text,
-                original_request=pending.original_request,
-            )
-        except Exception:
-            logger.exception("Failed to generate revised spec")
-            await self.slack.post_message(
-                event.channel or "",
-                "Sorry, I couldn't revise the spec. Please try again.",
-                thread_ts=event.conversation_ts,
-            )
-            return
-
-        # Persist a new execution for the V2 spec
-        new_execution_id = uuid.uuid4().hex
-        new_execution = ActionExecution(
-            id=new_execution_id,
-            channel=pending.channel,
-            thread_ts=pending.thread_ts,
-            user_id=pending.user_id,
-            original_request=pending.original_request,
-            generated_spec=new_spec,
-            status="pending",
-            model=pending.model,
-        )
-        try:
-            # Mark old execution as rejected since we're replacing it
-            await self.supabase.update_action_execution_status(pending.id, "rejected")
-            await self.supabase.save_action_execution(new_execution)
-        except Exception:
-            logger.warning("Failed to persist revised execution", exc_info=True)
-
-        blocks = self.action._build_spec_blocks(new_spec, new_execution_id)
-        try:
-            await self.slack.post_blocks(
-                event.channel or "",
-                blocks,
-                text="Revised implementation spec ready for review",
-                thread_ts=event.conversation_ts,
-            )
-        except Exception:
-            logger.exception("Failed to post revised spec blocks; falling back to plain text")
-            await self.slack.post_message(
-                event.channel or "",
-                f"*Revised Implementation Spec:*\n\n{new_spec}",
-                thread_ts=event.conversation_ts,
-            )

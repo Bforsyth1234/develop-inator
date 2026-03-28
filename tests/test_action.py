@@ -38,6 +38,11 @@ class FakeSlackGateway:
     ) -> None:
         self.update_calls.append({"channel": channel, "ts": ts, "text": text, "blocks": blocks})
 
+    async def fetch_replies(
+        self, channel: str, thread_ts: str, *, oldest: str | None = None, limit: int = 100,
+    ) -> list[dict]:
+        return []
+
 
 class FakeGitService:
     """Records create_pull_request calls and returns a canned PR URL."""
@@ -66,7 +71,7 @@ class FakeLanguageModel:
             "is_actionable": True,
             "clarifying_question": None,
             "optimized_prompt": "Optimized: do the thing in FooComponent",
-            "complexity_tier": "simple",
+            "complexity_tier": "standard",
             "target_repository": "owner/repo",
         }
         self._raise = raise_on_generate
@@ -213,57 +218,57 @@ def _make_proc(*, returncode: int, stdout: str = "", stderr: str = "") -> mock.M
     return proc
 
 
+def _make_aider_result(
+    stdout: str = "Aider applied changes.",
+    returncode: int = 0,
+    stderr: str = "",
+) -> subprocess.CompletedProcess:
+    """Build a CompletedProcess for mocking _run_aider_subprocess."""
+    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
+
+
 def _make_git_aware_side_effect(
-    aider_stdout: str = "Aider applied changes.",
-    aider_returncode: int = 0,
-    aider_stderr: str = "",
     aider_makes_commits: bool = True,
     test_returncode: int = 0,
     test_stdout: str = "",
     test_stderr: str = "",
 ):
-    """Return a side_effect for asyncio.to_thread that understands the full git workflow.
+    """Return a side_effect for asyncio.to_thread that handles git + test commands.
 
-    The _run_aider flow:
+    Aider commands now flow through _run_aider_subprocess (mocked separately).
+
+    The git flow:
       rev-parse --abbrev-ref HEAD → stash → fetch origin main →
       rev-parse origin/main (base SHA) → checkout -b ... origin/main →
-      aider → rev-parse HEAD (current SHA) → [test] → push → checkout base → stash pop
+      [aider via _run_aider_subprocess] →
+      rev-parse HEAD (current SHA) → [test] → push → checkout base → stash pop
     """
-    aider_ran = False
+    checkout_b_done = False
 
     async def side_effect(_fn, cmd, **kwargs):
-        nonlocal aider_ran
+        nonlocal checkout_b_done
 
-        # Non-git command = aider or test runner
+        # Non-git command = test runner or aider retry (via to_thread)
         if cmd[0] != "git":
-            if not aider_ran:
-                # First non-git command is aider
-                aider_ran = True
-                return _make_proc(returncode=aider_returncode, stdout=aider_stdout, stderr=aider_stderr)
-            # Subsequent non-git commands: test runner or aider retry
-            cmd_name = cmd[0] if cmd else ""
-            if cmd_name in ("npm", "pytest"):
-                return _make_proc(returncode=test_returncode, stdout=test_stdout, stderr=test_stderr)
-            # Aider retry
-            return _make_proc(returncode=0, stdout="Aider fixed tests.", stderr="")
+            return _make_proc(returncode=test_returncode, stdout=test_stdout, stderr=test_stderr)
 
         subcmd = cmd[1] if len(cmd) > 1 else ""
+
+        if subcmd == "checkout" and "-b" in cmd:
+            checkout_b_done = True
+            return _make_proc(returncode=0)
 
         if subcmd == "rev-parse":
             if "--abbrev-ref" in cmd:
                 return _make_proc(returncode=0, stdout="main")
-            # After aider ran: return different SHA if aider made commits
-            if aider_ran:
-                if aider_makes_commits:
-                    return _make_proc(returncode=0, stdout="new-sha-111")
-                return _make_proc(returncode=0, stdout="base-sha-000")
-            # Before aider: base SHA (for origin/main)
+            if checkout_b_done and aider_makes_commits:
+                return _make_proc(returncode=0, stdout="new-sha-111")
             return _make_proc(returncode=0, stdout="base-sha-000")
 
         if subcmd == "stash":
             return _make_proc(returncode=0, stdout="No local changes to save")
 
-        # fetch, checkout, push, branch -D, etc.
+        # fetch, checkout (non -b), push, branch -D, etc.
         return _make_proc(returncode=0)
 
     return side_effect
@@ -273,10 +278,8 @@ def _make_git_aware_side_effect(
 _make_successful_side_effect = _make_git_aware_side_effect
 
 
-_DEFAULT_TIER_MAP = {
-    "simple": "anthropic/claude-sonnet-4-20250514",
-    "complex": "anthropic/claude-opus-4-20250514",
-}
+_DEFAULT_TRIVIAL_MODEL = "groq/llama-3.3-70b-versatile"
+_DEFAULT_STANDARD_MODEL = "anthropic/claude-sonnet-4-6"
 
 
 class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
@@ -295,7 +298,6 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
         git: FakeGitService,
         llm: FakeLanguageModel | None = None,
         github_token: str = "stub",
-        model_tier_map: dict[str, str] | None = None,
         repo_map: list[str] | None = None,
     ) -> ActionWorkflow:
         return ActionWorkflow(
@@ -303,7 +305,8 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
             git=git,
             llm=llm or FakeLanguageModel(),
             github_token=github_token,
-            model_tier_map=model_tier_map or _DEFAULT_TIER_MAP,
+            aider_model_trivial=_DEFAULT_TRIVIAL_MODEL,
+            aider_model_standard=_DEFAULT_STANDARD_MODEL,
             repo_map=repo_map or ["owner/repo"],
         )
 
@@ -311,16 +314,19 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
         slack = FakeSlackGateway()
         git = FakeGitService()
 
-        with mock.patch(
-            "slack_bot_backend.workflows.action.asyncio.to_thread",
-            side_effect=_make_successful_side_effect(),
+        with (
+            mock.patch(
+                "slack_bot_backend.workflows.action.asyncio.to_thread",
+                side_effect=_make_successful_side_effect(),
+            ),
+            mock.patch.object(ActionWorkflow, "_run_aider_subprocess", return_value=_make_aider_result()),
         ):
             result = await self._make_workflow(slack=slack, git=git).run(
                 ActionRequest(channel="C123", thread_ts="1710.2", request="Update the deploy docs")
             )
 
         self.assertEqual(result.status, "completed")
-        self.assertEqual(result.provider, _DEFAULT_TIER_MAP["simple"])
+        self.assertEqual(result.provider, _DEFAULT_STANDARD_MODEL)
         self.assertTrue(result.branch_name.startswith("ai-update-"))
         self.assertEqual(result.pr_url, "https://example.invalid/pr/42")
         self.assertEqual(len(git.pr_calls), 1)
@@ -335,13 +341,14 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
         slack = FakeSlackGateway()
         git = FakeGitService()
 
-        with mock.patch(
-            "slack_bot_backend.workflows.action.asyncio.to_thread",
-            side_effect=_make_git_aware_side_effect(
-                aider_returncode=1,
-                aider_stderr="fatal: not a git repository",
-                aider_stdout="",
+        with (
+            mock.patch(
+                "slack_bot_backend.workflows.action.asyncio.to_thread",
+                side_effect=_make_git_aware_side_effect(),
             ),
+            mock.patch.object(ActionWorkflow, "_run_aider_subprocess", return_value=_make_aider_result(
+                returncode=1, stderr="fatal: not a git repository", stdout="",
+            )),
         ):
             result = await self._make_workflow(slack=slack, git=git).run(
                 ActionRequest(channel="C123", thread_ts="1710.2", request="Update the deploy docs")
@@ -358,17 +365,19 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
         slack = FakeSlackGateway()
         git = FakeGitService(fail=True)
 
-        with mock.patch(
-            "slack_bot_backend.workflows.action.asyncio.to_thread",
-            side_effect=_make_successful_side_effect(),
+        with (
+            mock.patch(
+                "slack_bot_backend.workflows.action.asyncio.to_thread",
+                side_effect=_make_successful_side_effect(),
+            ),
+            mock.patch.object(ActionWorkflow, "_run_aider_subprocess", return_value=_make_aider_result()),
         ):
             result = await self._make_workflow(slack=slack, git=git).run(
                 ActionRequest(channel="C123", thread_ts="1710.2", request="Update the deploy docs")
             )
 
         self.assertEqual(result.status, "error")
-        self.assertEqual(result.provider, "error")
-        self.assertIn("internal error", result.message)
+        self.assertIn("PR creation failed", result.message)
 
     async def test_aider_command_includes_model_and_message(self) -> None:
         """The aider subprocess receives --model, --yes-always, and --message with the optimized prompt."""
@@ -378,28 +387,35 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "is_actionable": True,
             "clarifying_question": None,
             "optimized_prompt": "Add a dark-mode toggle to the AppComponent",
-            "complexity_tier": "simple",
+            "complexity_tier": "standard",
             "target_repository": "owner/repo",
         })
-        captured_cmd: list[list[str]] = []
+        captured_git_cmd: list[list[str]] = []
         _delegate = _make_git_aware_side_effect()
 
         async def capture_to_thread(_fn, cmd, **kwargs):
-            captured_cmd.append(cmd)
+            captured_git_cmd.append(cmd)
             return await _delegate(_fn, cmd, **kwargs)
 
-        with mock.patch(
-            "slack_bot_backend.workflows.action.asyncio.to_thread",
-            side_effect=capture_to_thread,
+        mock_aider = mock.AsyncMock(return_value=_make_aider_result())
+
+        with (
+            mock.patch(
+                "slack_bot_backend.workflows.action.asyncio.to_thread",
+                side_effect=capture_to_thread,
+            ),
+            mock.patch.object(ActionWorkflow, "_run_aider_subprocess", mock_aider),
         ):
             await self._make_workflow(slack=slack, git=git, llm=llm).run(
                 ActionRequest(channel="C123", thread_ts="1710.2", request="Add a dark-mode toggle")
             )
 
         # Find specific commands by type
-        checkout_cmd = [c for c in captured_cmd if c[0] == "git" and len(c) > 2 and c[1] == "checkout" and "-b" in c][0]
-        aider_cmd = [c for c in captured_cmd if c[0] != "git"][0]
-        push_cmd = [c for c in captured_cmd if c[0] == "git" and len(c) > 1 and c[1] == "push"][0]
+        checkout_cmd = [c for c in captured_git_cmd if c[0] == "git" and len(c) > 2 and c[1] == "checkout" and "-b" in c][0]
+        push_cmd = [c for c in captured_git_cmd if c[0] == "git" and len(c) > 1 and c[1] == "push"][0]
+
+        # aider cmd is captured via the mock
+        aider_cmd = mock_aider.call_args[0][0]  # first positional arg
 
         # checkout creates branch
         self.assertTrue(checkout_cmd[3].startswith("ai-update-"))
@@ -430,26 +446,24 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "is_actionable": True,
             "clarifying_question": None,
             "optimized_prompt": "In LoginComponent set the button colour to #E53935",
-            "complexity_tier": "simple",
+            "complexity_tier": "standard",
             "target_repository": "owner/repo",
         })
-        captured_cmd: list[list[str]] = []
-        _delegate = _make_git_aware_side_effect()
+        mock_aider = mock.AsyncMock(return_value=_make_aider_result())
 
-        async def capture_to_thread(_fn, cmd, **kwargs):
-            captured_cmd.append(cmd)
-            return await _delegate(_fn, cmd, **kwargs)
-
-        with mock.patch(
-            "slack_bot_backend.workflows.action.asyncio.to_thread",
-            side_effect=capture_to_thread,
+        with (
+            mock.patch(
+                "slack_bot_backend.workflows.action.asyncio.to_thread",
+                side_effect=_make_git_aware_side_effect(),
+            ),
+            mock.patch.object(ActionWorkflow, "_run_aider_subprocess", mock_aider),
         ):
             result = await self._make_workflow(slack=slack, git=git, llm=llm).run(
                 ActionRequest(channel="C123", thread_ts="1710.2", request="Make the button red")
             )
 
         self.assertEqual(result.status, "completed")
-        aider_cmd = [c for c in captured_cmd if c[0] != "git"][0]
+        aider_cmd = mock_aider.call_args[0][0]
         msg_idx = aider_cmd.index("--message") + 1
         self.assertIn("LoginComponent", aider_cmd[msg_idx])
         self.assertIn("#E53935", aider_cmd[msg_idx])
@@ -463,7 +477,7 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "is_actionable": False,
             "clarifying_question": "Which component should the button colour change apply to?",
             "optimized_prompt": None,
-            "complexity_tier": "simple",
+            "complexity_tier": "standard",
         })
 
         with mock.patch(
@@ -516,9 +530,12 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
         wf.supabase = supabase
 
-        with mock.patch(
-            "slack_bot_backend.workflows.action.asyncio.to_thread",
-            side_effect=_make_successful_side_effect(),
+        with (
+            mock.patch(
+                "slack_bot_backend.workflows.action.asyncio.to_thread",
+                side_effect=_make_successful_side_effect(),
+            ),
+            mock.patch.object(ActionWorkflow, "_run_aider_subprocess", return_value=_make_aider_result()),
         ):
             result = await wf.run(
                 ActionRequest(channel="C123", thread_ts="1710.2", request="owner/repo")
@@ -548,7 +565,7 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "is_actionable": True,
             "clarifying_question": None,
             "optimized_prompt": "Change the color scheme",
-            "complexity_tier": "simple",
+            "complexity_tier": "standard",
             "target_repository": None,
         })
         wf = self._make_workflow(
@@ -581,9 +598,12 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
         wf.supabase = supabase
 
-        with mock.patch(
-            "slack_bot_backend.workflows.action.asyncio.to_thread",
-            side_effect=_make_successful_side_effect(),
+        with (
+            mock.patch(
+                "slack_bot_backend.workflows.action.asyncio.to_thread",
+                side_effect=_make_successful_side_effect(),
+            ),
+            mock.patch.object(ActionWorkflow, "_run_aider_subprocess", return_value=_make_aider_result()),
         ):
             result = await wf.run(
                 ActionRequest(channel="C123", thread_ts="1710.2", request="Fix the bug")
@@ -604,7 +624,7 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "is_actionable": True,
             "clarifying_question": None,
             "optimized_prompt": "Fix the bug",
-            "complexity_tier": "simple",
+            "complexity_tier": "standard",
             "target_repository": None,
         })
         wf = self._make_workflow(
@@ -613,9 +633,12 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
         wf.supabase = supabase
 
-        with mock.patch(
-            "slack_bot_backend.workflows.action.asyncio.to_thread",
-            side_effect=_make_successful_side_effect(),
+        with (
+            mock.patch(
+                "slack_bot_backend.workflows.action.asyncio.to_thread",
+                side_effect=_make_successful_side_effect(),
+            ),
+            mock.patch.object(ActionWorkflow, "_run_aider_subprocess", return_value=_make_aider_result()),
         ):
             result = await wf.run(
                 ActionRequest(channel="C123", thread_ts="1710.2", request="Fix the bug")
@@ -632,16 +655,14 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
         llm = FakeLanguageModel()
         llm._evaluator_json = {}  # will produce JSON that fails EvaluationResult validation
 
-        captured_cmd: list[list[str]] = []
-        _delegate = _make_git_aware_side_effect()
+        mock_aider = mock.AsyncMock(return_value=_make_aider_result())
 
-        async def capture_to_thread(_fn, cmd, **kwargs):
-            captured_cmd.append(cmd)
-            return await _delegate(_fn, cmd, **kwargs)
-
-        with mock.patch(
-            "slack_bot_backend.workflows.action.asyncio.to_thread",
-            side_effect=capture_to_thread,
+        with (
+            mock.patch(
+                "slack_bot_backend.workflows.action.asyncio.to_thread",
+                side_effect=_make_git_aware_side_effect(),
+            ),
+            mock.patch.object(ActionWorkflow, "_run_aider_subprocess", mock_aider),
         ):
             result = await self._make_workflow(slack=slack, git=git, llm=llm).run(
                 ActionRequest(channel="C123", thread_ts="1710.2", request="Fallback request text")
@@ -649,7 +670,7 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
         # Should still complete using the original request
         self.assertEqual(result.status, "completed")
-        aider_cmd = [c for c in captured_cmd if c[0] != "git"][0]
+        aider_cmd = mock_aider.call_args[0][0]
         msg_idx = aider_cmd.index("--message") + 1
         self.assertIn("Fallback request text", aider_cmd[msg_idx])
 
@@ -659,9 +680,12 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
         git = FakeGitService()
         llm = FakeLanguageModel(raise_on_generate=True)
 
-        with mock.patch(
-            "slack_bot_backend.workflows.action.asyncio.to_thread",
-            side_effect=_make_successful_side_effect(),
+        with (
+            mock.patch(
+                "slack_bot_backend.workflows.action.asyncio.to_thread",
+                side_effect=_make_successful_side_effect(),
+            ),
+            mock.patch.object(ActionWorkflow, "_run_aider_subprocess", return_value=_make_aider_result()),
         ):
             result = await self._make_workflow(slack=slack, git=git, llm=llm).run(
                 ActionRequest(channel="C123", thread_ts="1710.2", request="Exception fallback test")
@@ -673,39 +697,66 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
     # Complexity-tier model routing tests
     # ------------------------------------------------------------------
 
-    async def test_simple_tier_routes_to_correct_model(self) -> None:
-        """A 'simple' complexity_tier sends the simple-tier model to Aider."""
+    async def test_trivial_tier_routes_to_trivial_model(self) -> None:
+        """A 'trivial' complexity_tier sends the trivial-tier model (Groq) to Aider."""
         slack = FakeSlackGateway()
         git = FakeGitService()
         llm = FakeLanguageModel(evaluator_json={
             "is_actionable": True,
             "clarifying_question": None,
             "optimized_prompt": "Change the button text in HeaderComponent to 'Sign In'",
-            "complexity_tier": "simple",
+            "complexity_tier": "trivial",
             "target_repository": "owner/repo",
         })
-        captured_cmd: list[list[str]] = []
-        _delegate = _make_git_aware_side_effect()
+        mock_aider = mock.AsyncMock(return_value=_make_aider_result())
 
-        async def capture_to_thread(_fn, cmd, **kwargs):
-            captured_cmd.append(cmd)
-            return await _delegate(_fn, cmd, **kwargs)
-
-        with mock.patch(
-            "slack_bot_backend.workflows.action.asyncio.to_thread",
-            side_effect=capture_to_thread,
+        with (
+            mock.patch(
+                "slack_bot_backend.workflows.action.asyncio.to_thread",
+                side_effect=_make_git_aware_side_effect(),
+            ),
+            mock.patch.object(ActionWorkflow, "_run_aider_subprocess", mock_aider),
         ):
             result = await self._make_workflow(slack=slack, git=git, llm=llm).run(
                 ActionRequest(channel="C123", thread_ts="1710.2", request="Change button text")
             )
 
         self.assertEqual(result.status, "completed")
-        aider_cmd = [c for c in captured_cmd if c[0] != "git"][0]
+        aider_cmd = mock_aider.call_args[0][0]
         model_idx = aider_cmd.index("--model") + 1
-        self.assertEqual(aider_cmd[model_idx], _DEFAULT_TIER_MAP["simple"])
+        self.assertEqual(aider_cmd[model_idx], _DEFAULT_TRIVIAL_MODEL)
 
-    async def test_complex_tier_routes_to_planner(self) -> None:
-        """A 'complex' complexity_tier invokes the Planner instead of Aider directly."""
+    async def test_standard_tier_routes_to_standard_model(self) -> None:
+        """A 'standard' complexity_tier sends the standard-tier model (Sonnet) to Aider."""
+        slack = FakeSlackGateway()
+        git = FakeGitService()
+        llm = FakeLanguageModel(evaluator_json={
+            "is_actionable": True,
+            "clarifying_question": None,
+            "optimized_prompt": "Refactor LoginComponent to use reactive forms",
+            "complexity_tier": "standard",
+            "target_repository": "owner/repo",
+        })
+        mock_aider = mock.AsyncMock(return_value=_make_aider_result())
+
+        with (
+            mock.patch(
+                "slack_bot_backend.workflows.action.asyncio.to_thread",
+                side_effect=_make_git_aware_side_effect(),
+            ),
+            mock.patch.object(ActionWorkflow, "_run_aider_subprocess", mock_aider),
+        ):
+            result = await self._make_workflow(slack=slack, git=git, llm=llm).run(
+                ActionRequest(channel="C123", thread_ts="1710.2", request="Refactor login")
+            )
+
+        self.assertEqual(result.status, "completed")
+        aider_cmd = mock_aider.call_args[0][0]
+        model_idx = aider_cmd.index("--model") + 1
+        self.assertEqual(aider_cmd[model_idx], _DEFAULT_STANDARD_MODEL)
+
+    async def test_complex_tier_routes_to_openhands_when_enabled(self) -> None:
+        """A 'complex' complexity_tier invokes OpenHands when openhands_enabled=True."""
         slack = FakeSlackGateway()
         git = FakeGitService()
         llm = FakeLanguageModel(evaluator_json={
@@ -716,54 +767,151 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "target_repository": "owner/repo",
         })
 
-        # The planner LLM call (second generate call) returns a spec string
-        call_count = 0
-        original_generate = llm.generate
-
-        async def patched_generate(prompt: str) -> LLMResult:
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                # First call is the evaluator
-                return await original_generate(prompt)
-            # Second call is the planner — return a markdown spec
-            return LLMResult(content="## Implementation Spec\n1. Refactor AuthService", provider="fake")
-
-        llm.generate = patched_generate
-
-        result = await self._make_workflow(slack=slack, git=git, llm=llm).run(
-            ActionRequest(channel="C123", thread_ts="1710.2", request="Refactor auth to use NgRx")
+        wf = ActionWorkflow(
+            slack=slack,
+            git=git,
+            llm=llm,
+            github_token="stub",
+            aider_model_trivial=_DEFAULT_TRIVIAL_MODEL,
+            aider_model_standard=_DEFAULT_STANDARD_MODEL,
+            repo_map=["owner/repo"],
+            openhands_enabled=True,
+            openhands_model="anthropic/claude-sonnet-4-6",
+            openhands_url="https://app.all-hands.dev",
+            openhands_api_key="test-api-key",
         )
 
+        fake_oh_result = AiderResult(
+            returncode=0,
+            stdout="OpenHands completed",
+            stderr="",
+            branch_name="ai-update-12345",
+        )
+
+        with mock.patch.object(wf, "_run_openhands", return_value=fake_oh_result) as mock_oh:
+            result = await wf.run(
+                ActionRequest(channel="C123", thread_ts="1710.2", request="Refactor auth to use NgRx")
+            )
+
+        mock_oh.assert_called_once()
         self.assertEqual(result.status, "completed")
-        self.assertEqual(result.provider, "planner")
-        # Should have posted a "generating spec" message + Block Kit blocks
-        self.assertTrue(len(slack.messages) >= 1)
-        self.assertIn("complex", slack.messages[0]["text"])
-        self.assertEqual(len(slack.blocks_calls), 1)
-        blocks = slack.blocks_calls[0]["blocks"]
-        # Should have approve/reject buttons
-        action_block = [b for b in blocks if b.get("type") == "actions"][0]
-        action_ids = [e["action_id"] for e in action_block["elements"]]
-        self.assertIn("approve_spec", action_ids)
-        self.assertIn("reject_spec", action_ids)
+
+    # ------------------------------------------------------------------
+    # Tier-flag override tests  (--trivial / --standard / --complex)
+    # ------------------------------------------------------------------
+
+    async def test_trivial_flag_forces_trivial_model_regardless_of_evaluator(self) -> None:
+        """--trivial in the message forces the trivial model even if evaluator says standard."""
+        slack = FakeSlackGateway()
+        git = FakeGitService()
+        # Evaluator would normally say "standard"
+        llm = FakeLanguageModel(evaluator_json={
+            "is_actionable": True,
+            "clarifying_question": None,
+            "optimized_prompt": "Fix the typo",
+            "complexity_tier": "standard",
+            "target_repository": "owner/repo",
+        })
+        mock_aider = mock.AsyncMock(return_value=_make_aider_result())
+
+        with (
+            mock.patch(
+                "slack_bot_backend.workflows.action.asyncio.to_thread",
+                side_effect=_make_git_aware_side_effect(),
+            ),
+            mock.patch.object(ActionWorkflow, "_run_aider_subprocess", mock_aider),
+        ):
+            result = await self._make_workflow(slack=slack, git=git, llm=llm).run(
+                ActionRequest(channel="C123", thread_ts="1710.2", request="Fix the typo --trivial")
+            )
+
+        self.assertEqual(result.status, "completed")
+        aider_cmd = mock_aider.call_args[0][0]
+        model_idx = aider_cmd.index("--model") + 1
+        self.assertEqual(aider_cmd[model_idx], _DEFAULT_TRIVIAL_MODEL)
+        # Flag must be stripped from the prompt sent to Aider
+        msg_idx = aider_cmd.index("--message") + 1
+        self.assertNotIn("--trivial", aider_cmd[msg_idx])
+
+    async def test_standard_flag_forces_standard_model(self) -> None:
+        """--standard in the message forces the standard model."""
+        slack = FakeSlackGateway()
+        git = FakeGitService()
+        llm = FakeLanguageModel(evaluator_json={
+            "is_actionable": True,
+            "clarifying_question": None,
+            "optimized_prompt": "Add dark mode",
+            "complexity_tier": "trivial",
+            "target_repository": "owner/repo",
+        })
+        mock_aider = mock.AsyncMock(return_value=_make_aider_result())
+
+        with (
+            mock.patch(
+                "slack_bot_backend.workflows.action.asyncio.to_thread",
+                side_effect=_make_git_aware_side_effect(),
+            ),
+            mock.patch.object(ActionWorkflow, "_run_aider_subprocess", mock_aider),
+        ):
+            result = await self._make_workflow(slack=slack, git=git, llm=llm).run(
+                ActionRequest(channel="C123", thread_ts="1710.2", request="Add dark mode --standard")
+            )
+
+        self.assertEqual(result.status, "completed")
+        aider_cmd = mock_aider.call_args[0][0]
+        model_idx = aider_cmd.index("--model") + 1
+        self.assertEqual(aider_cmd[model_idx], _DEFAULT_STANDARD_MODEL)
+        msg_idx = aider_cmd.index("--message") + 1
+        self.assertNotIn("--standard", aider_cmd[msg_idx])
+
+    async def test_complex_flag_routes_to_openhands_when_enabled(self) -> None:
+        """--complex in the message forces OpenHands routing when openhands_enabled=True."""
+        slack = FakeSlackGateway()
+        git = FakeGitService()
+        # Evaluator says trivial — flag should override it
+        llm = FakeLanguageModel(evaluator_json={
+            "is_actionable": True,
+            "clarifying_question": None,
+            "optimized_prompt": "Fix the typo",
+            "complexity_tier": "trivial",
+            "target_repository": "owner/repo",
+        })
+        wf = ActionWorkflow(
+            slack=slack,
+            git=git,
+            llm=llm,
+            github_token="stub",
+            aider_model_trivial=_DEFAULT_TRIVIAL_MODEL,
+            aider_model_standard=_DEFAULT_STANDARD_MODEL,
+            repo_map=["owner/repo"],
+            openhands_enabled=True,
+            openhands_model="anthropic/claude-sonnet-4-6",
+            openhands_url="https://app.all-hands.dev",
+            openhands_api_key="test-api-key",
+        )
+        fake_oh_result = AiderResult(
+            returncode=0, stdout="OpenHands completed", stderr="", branch_name="ai-update-12345",
+        )
+        with mock.patch.object(wf, "_run_openhands", return_value=fake_oh_result) as mock_oh:
+            result = await wf.run(
+                ActionRequest(channel="C123", thread_ts="1710.2", request="Fix the typo --complex")
+            )
+
+        mock_oh.assert_called_once()
+        self.assertEqual(result.status, "completed")
 
     async def test_aider_subprocess_receives_env_with_api_keys(self) -> None:
         """The Aider subprocess env includes GROQ_API_KEY and ANTHROPIC_API_KEY."""
         slack = FakeSlackGateway()
         git = FakeGitService()
-        captured_calls: list[tuple[list[str], dict]] = []
-        _delegate = _make_git_aware_side_effect()
-
-        async def capture_to_thread(_fn, cmd, **kwargs):
-            captured_calls.append((cmd, kwargs))
-            return await _delegate(_fn, cmd, **kwargs)
+        mock_aider = mock.AsyncMock(return_value=_make_aider_result())
 
         with (
             mock.patch(
                 "slack_bot_backend.workflows.action.asyncio.to_thread",
-                side_effect=capture_to_thread,
+                side_effect=_make_git_aware_side_effect(),
             ),
+            mock.patch.object(ActionWorkflow, "_run_aider_subprocess", mock_aider),
             mock.patch.dict(
                 "os.environ",
                 {"GROQ_API_KEY": "gsk_test123", "ANTHROPIC_API_KEY": "sk-ant-test456"},
@@ -773,10 +921,9 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 ActionRequest(channel="C123", thread_ts="1710.2", request="Update deploy docs")
             )
 
-        # Find the aider call (non-git command) — it should have env kwarg
-        aider_call = [(cmd, kw) for cmd, kw in captured_calls if cmd[0] != "git"]
-        self.assertEqual(len(aider_call), 1)
-        aider_kwargs = aider_call[0][1]
+        # _run_aider_subprocess should have been called with env kwarg
+        mock_aider.assert_called_once()
+        aider_kwargs = mock_aider.call_args[1]  # keyword args
         self.assertIn("env", aider_kwargs)
         self.assertEqual(aider_kwargs["env"]["GROQ_API_KEY"], "gsk_test123")
         self.assertEqual(aider_kwargs["env"]["ANTHROPIC_API_KEY"], "sk-ant-test456")
@@ -804,12 +951,16 @@ class ActionWorkflowRepoConfigTests(unittest.IsolatedAsyncioTestCase):
             github_token="stub",
             supabase=supabase,
             repo_map=["owner/repo"],
-            model_tier_map=_DEFAULT_TIER_MAP,
+            aider_model_trivial=_DEFAULT_TRIVIAL_MODEL,
+            aider_model_standard=_DEFAULT_STANDARD_MODEL,
         )
 
-        with mock.patch(
-            "slack_bot_backend.workflows.action.asyncio.to_thread",
-            side_effect=_make_successful_side_effect(),
+        with (
+            mock.patch(
+                "slack_bot_backend.workflows.action.asyncio.to_thread",
+                side_effect=_make_successful_side_effect(),
+            ),
+            mock.patch.object(ActionWorkflow, "_run_aider_subprocess", return_value=_make_aider_result()),
         ):
             result = await workflow.run(
                 ActionRequest(channel="C123", thread_ts="1710.2", request="Fix the bug")
@@ -828,13 +979,17 @@ class ActionWorkflowRepoConfigTests(unittest.IsolatedAsyncioTestCase):
             git=git,
             llm=FakeLanguageModel(),
             github_token="stub",
-            model_tier_map=_DEFAULT_TIER_MAP,
+            aider_model_trivial=_DEFAULT_TRIVIAL_MODEL,
+            aider_model_standard=_DEFAULT_STANDARD_MODEL,
             repo_map=["owner/repo"],
         )
 
-        with mock.patch(
-            "slack_bot_backend.workflows.action.asyncio.to_thread",
-            side_effect=_make_successful_side_effect(),
+        with (
+            mock.patch(
+                "slack_bot_backend.workflows.action.asyncio.to_thread",
+                side_effect=_make_successful_side_effect(),
+            ),
+            mock.patch.object(ActionWorkflow, "_run_aider_subprocess", return_value=_make_aider_result()),
         ):
             result = await workflow.run(
                 ActionRequest(channel="C123", thread_ts="1710.2", request="Fix the bug")
@@ -854,13 +1009,17 @@ class ActionWorkflowRepoConfigTests(unittest.IsolatedAsyncioTestCase):
             llm=FakeLanguageModel(),
             github_token="stub",
             supabase=supabase,
-            model_tier_map=_DEFAULT_TIER_MAP,
+            aider_model_trivial=_DEFAULT_TRIVIAL_MODEL,
+            aider_model_standard=_DEFAULT_STANDARD_MODEL,
             repo_map=["owner/repo"],
         )
 
-        with mock.patch(
-            "slack_bot_backend.workflows.action.asyncio.to_thread",
-            side_effect=_make_successful_side_effect(),
+        with (
+            mock.patch(
+                "slack_bot_backend.workflows.action.asyncio.to_thread",
+                side_effect=_make_successful_side_effect(),
+            ),
+            mock.patch.object(ActionWorkflow, "_run_aider_subprocess", return_value=_make_aider_result()),
         ):
             result = await workflow.run(
                 ActionRequest(channel="C123", thread_ts="1710.2", request="Fix the bug")
@@ -881,15 +1040,19 @@ class ActionWorkflowRepoConfigTests(unittest.IsolatedAsyncioTestCase):
             llm=FakeLanguageModel(),
             github_token="stub",
             supabase=supabase,
-            model_tier_map=_DEFAULT_TIER_MAP,
+            aider_model_trivial=_DEFAULT_TRIVIAL_MODEL,
+            aider_model_standard=_DEFAULT_STANDARD_MODEL,
             repo_map=["owner/repo"],
         )
 
-        with mock.patch(
-            "slack_bot_backend.workflows.action.asyncio.to_thread",
-            side_effect=_make_git_aware_side_effect(
-                aider_returncode=1, aider_stderr="error", aider_stdout="",
+        with (
+            mock.patch(
+                "slack_bot_backend.workflows.action.asyncio.to_thread",
+                side_effect=_make_git_aware_side_effect(),
             ),
+            mock.patch.object(ActionWorkflow, "_run_aider_subprocess", return_value=_make_aider_result(
+                returncode=1, stderr="error", stdout="",
+            )),
         ):
             result = await workflow.run(
                 ActionRequest(channel="C123", thread_ts="1710.2", request="Fix the bug")
@@ -1048,7 +1211,8 @@ class TestValidationLoopTests(unittest.IsolatedAsyncioTestCase):
             git=git,
             llm=llm or FakeLanguageModel(),
             github_token=github_token,
-            model_tier_map=_DEFAULT_TIER_MAP,
+            aider_model_trivial=_DEFAULT_TRIVIAL_MODEL,
+            aider_model_standard=_DEFAULT_STANDARD_MODEL,
             repo_map=["owner/repo"],
         )
 
@@ -1064,6 +1228,7 @@ class TestValidationLoopTests(unittest.IsolatedAsyncioTestCase):
                     test_returncode=0, test_stdout="All tests passed",
                 ),
             ),
+            mock.patch.object(ActionWorkflow, "_run_aider_subprocess", return_value=_make_aider_result()),
         ):
             result = await self._make_workflow(slack=slack, git=git).run(
                 ActionRequest(channel="C1", thread_ts="1.1", request="Fix it")
@@ -1086,6 +1251,7 @@ class TestValidationLoopTests(unittest.IsolatedAsyncioTestCase):
                     test_stderr="AssertionError",
                 ),
             ),
+            mock.patch.object(ActionWorkflow, "_run_aider_subprocess", return_value=_make_aider_result()),
         ):
             result = await self._make_workflow(slack=slack, git=git).run(
                 ActionRequest(channel="C1", thread_ts="1.1", request="Fix it")
@@ -1107,6 +1273,7 @@ class TestValidationLoopTests(unittest.IsolatedAsyncioTestCase):
                 "slack_bot_backend.workflows.action.asyncio.to_thread",
                 side_effect=_make_successful_side_effect(),
             ),
+            mock.patch.object(ActionWorkflow, "_run_aider_subprocess", return_value=_make_aider_result()),
         ):
             result = await self._make_workflow(slack=slack, git=git).run(
                 ActionRequest(channel="C1", thread_ts="1.1", request="Fix it")
@@ -1120,22 +1287,18 @@ class TestValidationLoopTests(unittest.IsolatedAsyncioTestCase):
         slack = FakeSlackGateway()
         git = FakeGitService()
         test_call_count = 0
-        aider_ran = False
+        aider_called = False
 
         async def custom_side_effect(_fn, cmd, **kwargs):
-            nonlocal test_call_count, aider_ran
+            nonlocal test_call_count
             if cmd[0] != "git":
-                if not aider_ran:
-                    aider_ran = True
-                    return _make_proc(returncode=0, stdout="Aider applied changes.", stderr="")
-                # Check if this is a test command
+                # Test runner commands only (aider goes through _run_aider_subprocess)
                 if cmd[0] in ("npm", "pytest"):
                     test_call_count += 1
                     if test_call_count == 1:
                         return _make_proc(returncode=1, stdout="FAILED", stderr="err")
                     return _make_proc(returncode=0, stdout="All passed", stderr="")
-                # Aider retry
-                return _make_proc(returncode=0, stdout="Fixed.", stderr="")
+                return _make_proc(returncode=0, stdout="OK", stderr="")
 
             # Git commands
             subcmd = cmd[1] if len(cmd) > 1 else ""
@@ -1143,12 +1306,17 @@ class TestValidationLoopTests(unittest.IsolatedAsyncioTestCase):
                 if "--abbrev-ref" in cmd:
                     return _make_proc(returncode=0, stdout="main")
                 # After aider ran, return different SHA to indicate commits
-                if aider_ran:
+                if aider_called:
                     return _make_proc(returncode=0, stdout="new-sha-111")
                 return _make_proc(returncode=0, stdout="base-sha-000")
             if subcmd == "stash":
                 return _make_proc(returncode=0, stdout="No local changes to save")
             return _make_proc(returncode=0)
+
+        async def aider_side_effect(*args, **kwargs):
+            nonlocal aider_called
+            aider_called = True
+            return _make_aider_result()
 
         with (
             mock.patch.object(ActionWorkflow, "_detect_test_command", return_value=["pytest"]),
@@ -1156,6 +1324,7 @@ class TestValidationLoopTests(unittest.IsolatedAsyncioTestCase):
                 "slack_bot_backend.workflows.action.asyncio.to_thread",
                 side_effect=custom_side_effect,
             ),
+            mock.patch.object(ActionWorkflow, "_run_aider_subprocess", side_effect=aider_side_effect),
         ):
             result = await self._make_workflow(slack=slack, git=git).run(
                 ActionRequest(channel="C1", thread_ts="1.1", request="Fix it")
@@ -1175,7 +1344,8 @@ class TestDetectTestCommand(unittest.TestCase):
             git=FakeGitService(),
             llm=FakeLanguageModel(),
             github_token="stub",
-            model_tier_map=_DEFAULT_TIER_MAP,
+            aider_model_trivial=_DEFAULT_TRIVIAL_MODEL,
+            aider_model_standard=_DEFAULT_STANDARD_MODEL,
             repo_map=["owner/repo"],
         )
 
@@ -1215,154 +1385,6 @@ class TestDetectTestCommand(unittest.TestCase):
             self.assertIsNone(wf._detect_test_command(d))
 
 
-class ExecuteApprovedTests(unittest.IsolatedAsyncioTestCase):
-    """Tests for the _execute_approved background task in the approval flow."""
-
-    def setUp(self) -> None:
-        patcher = mock.patch.object(
-            ActionWorkflow, "_detect_test_command", return_value=None,
-        )
-        self._no_tests = patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def _make_execution(self) -> ActionExecution:
-        return ActionExecution(
-            id="exec-001",
-            channel="C123",
-            thread_ts="1710.2",
-            user_id="U456",
-            original_request="Refactor auth module",
-            generated_spec="## Spec\n1. Refactor AuthService",
-            status="approved",
-            model="anthropic/claude-sonnet-4-20250514",
-        )
-
-    def _make_container(
-        self,
-        *,
-        slack: FakeSlackGateway,
-        git: FakeGitService,
-        supabase: FakeSupabaseRepository,
-    ) -> ServiceContainer:
-        llm = FakeLanguageModel()
-        action = ActionWorkflow(
-            slack=slack,
-            git=git,
-            llm=llm,
-            github_token="stub",
-            supabase=supabase,
-            model_tier_map=_DEFAULT_TIER_MAP,
-            repo_map=["owner/repo"],
-        )
-        question = QuestionWorkflow(slack=slack, supabase=supabase, llm=llm)
-        return ServiceContainer(
-            settings=Settings(environment="testing"),
-            slack=slack,
-            supabase=supabase,
-            llm=llm,
-            git=git,
-            action=action,
-            intent=IntentWorkflow(
-                slack=slack, supabase=supabase, llm=llm,
-                question=question, action=action,
-            ),
-            question=question,
-        )
-
-    async def test_approved_spec_creates_pr_and_posts_success(self) -> None:
-        """After approval, _handle_spec_action dispatches to Celery."""
-        slack = FakeSlackGateway()
-        git = FakeGitService()
-        execution = self._make_execution()
-        supabase = FakeSupabaseRepository(stored_execution=execution)
-        container = self._make_container(slack=slack, git=git, supabase=supabase)
-
-        with mock.patch(
-            "slack_bot_backend.api.routes.process_spec_approval_task"
-        ) as mock_task:
-            from slack_bot_backend.api.routes import _handle_spec_action
-            payload = {
-                "actions": [{"action_id": "approve_spec", "value": "exec-001"}],
-                "container": {"message_ts": "1710.3"},
-            }
-            result = await _handle_spec_action(container, payload)
-
-        self.assertEqual(result, {"ok": True})
-        mock_task.apply_async.assert_called_once_with(
-            kwargs={"execution_id": "exec-001"},
-        )
-
-    async def test_approved_spec_with_existing_branch_uses_it(self) -> None:
-        """When a PR mapping exists, _handle_spec_action still dispatches to Celery."""
-        slack = FakeSlackGateway()
-        git = FakeGitService()
-        execution = self._make_execution()
-        pr_mapping = ActivePullRequestRecord(
-            pr_url="https://github.com/owner/repo/pull/10",
-            branch_name="ai-update-existing",
-            channel_id="C123",
-            thread_ts="1710.2",
-        )
-        supabase = FakeSupabaseRepository(stored_execution=execution, pr_mapping=pr_mapping)
-        container = self._make_container(slack=slack, git=git, supabase=supabase)
-
-        with mock.patch(
-            "slack_bot_backend.api.routes.process_spec_approval_task"
-        ) as mock_task:
-            from slack_bot_backend.api.routes import _handle_spec_action
-            payload = {
-                "actions": [{"action_id": "approve_spec", "value": "exec-001"}],
-                "container": {"message_ts": "1710.3"},
-            }
-            result = await _handle_spec_action(container, payload)
-
-        self.assertEqual(result, {"ok": True})
-        mock_task.apply_async.assert_called_once_with(
-            kwargs={"execution_id": "exec-001"},
-        )
-
-    async def test_approved_spec_aider_failure_posts_error(self) -> None:
-        """When approval is dispatched, Celery task is invoked."""
-        slack = FakeSlackGateway()
-        git = FakeGitService()
-        execution = self._make_execution()
-        supabase = FakeSupabaseRepository(stored_execution=execution)
-        container = self._make_container(slack=slack, git=git, supabase=supabase)
-
-        with mock.patch(
-            "slack_bot_backend.api.routes.process_spec_approval_task"
-        ) as mock_task:
-            from slack_bot_backend.api.routes import _handle_spec_action
-            payload = {
-                "actions": [{"action_id": "approve_spec", "value": "exec-001"}],
-                "container": {"message_ts": "1710.3"},
-            }
-            result = await _handle_spec_action(container, payload)
-
-        self.assertEqual(result, {"ok": True})
-        mock_task.apply_async.assert_called_once()
-
-    async def test_approved_spec_exception_posts_error_to_slack(self) -> None:
-        """Rejection updates execution status and updates the Slack message."""
-        slack = FakeSlackGateway()
-        git = FakeGitService()
-        execution = self._make_execution()
-        supabase = FakeSupabaseRepository(stored_execution=execution)
-        container = self._make_container(slack=slack, git=git, supabase=supabase)
-
-        from slack_bot_backend.api.routes import _handle_spec_action
-        payload = {
-            "actions": [{"action_id": "reject_spec", "value": "exec-001"}],
-            "container": {"message_ts": "1710.3"},
-        }
-        result = await _handle_spec_action(container, payload)
-
-        self.assertEqual(result, {"ok": True})
-        # Rejection message should have been sent via update_message
-        rejection_updates = [u for u in slack.update_calls if "rejected" in (u["text"] or "").lower()]
-        self.assertTrue(len(rejection_updates) >= 1, f"Expected rejection update, got: {slack.update_calls}")
-
-
 class SubprocessTimeoutTests(unittest.IsolatedAsyncioTestCase):
     """Tests for subprocess timeout handling in ActionWorkflow."""
 
@@ -1372,7 +1394,8 @@ class SubprocessTimeoutTests(unittest.IsolatedAsyncioTestCase):
             git=FakeGitService(),
             llm=FakeLanguageModel(),
             github_token="stub",
-            model_tier_map=_DEFAULT_TIER_MAP,
+            aider_model_trivial=_DEFAULT_TRIVIAL_MODEL,
+            aider_model_standard=_DEFAULT_STANDARD_MODEL,
             repo_map=["owner/repo"],
         )
 
@@ -1473,7 +1496,8 @@ class TestHandlePrCommentPassesTargetRepo(unittest.IsolatedAsyncioTestCase):
             git=git,
             llm=llm,
             github_token="stub",
-            model_tier_map=_DEFAULT_TIER_MAP,
+            aider_model_trivial=_DEFAULT_TRIVIAL_MODEL,
+            aider_model_standard=_DEFAULT_STANDARD_MODEL,
             supabase=supabase,
             repo_map=["acme/widgets"],
         )
@@ -1510,7 +1534,8 @@ class TestHandlePrCommentPassesTargetRepo(unittest.IsolatedAsyncioTestCase):
             git=git,
             llm=FakeLanguageModel(),
             github_token="stub",
-            model_tier_map=_DEFAULT_TIER_MAP,
+            aider_model_trivial=_DEFAULT_TRIVIAL_MODEL,
+            aider_model_standard=_DEFAULT_STANDARD_MODEL,
             supabase=supabase,
         )
 

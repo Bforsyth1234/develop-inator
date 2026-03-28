@@ -26,3 +26,13 @@ dependencies = [
 dev = [
   "httpx>=0.28,<1.0",
 ]
+
+
+[tool.uv]
+# Pin litellm to avoid aider 0.86.2 crash:
+# litellm >=1.81.11 adds PermissionDeniedError which is missing from
+# aider's EXCEPTIONS list, causing ValueError on every run.
+# Remove this constraint once aider is updated past 0.86.2.
+constraint-dependencies = [
+  "litellm<1.81.11",
+]

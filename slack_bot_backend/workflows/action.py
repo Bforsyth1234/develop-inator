@@ -26,14 +26,6 @@ from slack_bot_backend.services.interfaces import ContextSearch, LanguageModel, 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Model-tier mapping — keyed by the complexity_tier returned by the evaluator
-# ---------------------------------------------------------------------------
-
-_MODEL_TIER_MAP: dict[str, str] = {
-    "simple": "anthropic/claude-sonnet-4-20250514",
-    "complex": "anthropic/claude-opus-4-20250514",
-}
-
 # ---------------------------------------------------------------------------
 # Pre-flight evaluator prompt
 # ---------------------------------------------------------------------------
@@ -78,12 +70,15 @@ Do NOT ask for hex codes, file paths, or CSS variable names — Aider can \
 find those itself.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-COMPLEXITY TIER — choose EXACTLY one of "simple" or "complex":
+COMPLEXITY TIER — choose EXACTLY one of "trivial", "standard", or "complex":
 
-  "simple"  — single-component changes, copy/text updates, isolated CSS \
-tweaks, bug fixes, or small edits that likely touch 1-2 files.
+  "trivial"  — single-word text changes, typo fixes, or simple config string \
+updates that touch exactly one value in one file.
 
-  "complex" — ANY of the following:
+  "standard" — standard single-component changes, isolated bug fixes, copy \
+updates, CSS tweaks, or edits that touch 1-2 files.
+
+  "complex"  — ANY of the following:
     • Framework migrations or rewrites (e.g. React → Angular, Express → FastAPI)
     • Large-scale refactors that restructure significant portions of the codebase
     • Multi-file changes like theming overhauls, state management, API \
@@ -93,7 +88,7 @@ integrations, routing changes, or anything spanning 3+ files
     • Full feature implementations that require new modules, routes, models, \
 and tests
 
-When in doubt between "simple" and "complex", choose "complex".
+When in doubt between "standard" and "complex", choose "complex".
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 TARGET REPOSITORY — the system manages multiple repositories. You must \
@@ -120,13 +115,13 @@ OUTPUT FORMAT — respond with ONLY a JSON object, no markdown fences:
   "is_actionable": <true | false>,
   "clarifying_question": "<one focused question>" | null,
   "optimized_prompt": "<rewritten prompt>" | null,
-  "complexity_tier": "simple" | "complex",
+  "complexity_tier": "trivial" | "standard" | "complex",
   "target_repository": "<repo key from list above>" | null
 }}
 
 Rules:
   • If is_actionable is false  → clarifying_question must be non-null; \
-optimized_prompt must be null. complexity_tier should be "simple" (ignored).
+optimized_prompt must be null. complexity_tier should be "trivial" (ignored).
   • If is_actionable is true   → optimized_prompt must be non-null; \
 clarifying_question must be null.
   • optimized_prompt should be a clear instruction to a coding AI. Include \
@@ -154,11 +149,12 @@ class ActionWorkflow:
         github_token: str = "",
         repo_map: list[str] | None = None,
         supabase: SupabaseRepository | None = None,
-        model_tier_map: dict[str, str] | None = None,
+        aider_model_trivial: str = "groq/llama-3.3-70b-versatile",
+        aider_model_standard: str = "anthropic/claude-sonnet-4-6",
         aider_bin: str | None = None,
         context_search: ContextSearch | None = None,
         openhands_enabled: bool = False,
-        openhands_model: str = "anthropic/claude-3-5-sonnet-20241022",
+        openhands_model: str = "anthropic/claude-sonnet-4-6",
         openhands_url: str = "https://app.all-hands.dev",
         openhands_api_key: str | None = None,
     ) -> None:
@@ -168,7 +164,8 @@ class ActionWorkflow:
         self.github_token = github_token
         self.repo_map: list[str] = list(repo_map or [])
         self.supabase = supabase
-        self.model_tier_map: dict[str, str] = dict(model_tier_map or _MODEL_TIER_MAP)
+        self.aider_model_trivial = aider_model_trivial
+        self.aider_model_standard = aider_model_standard
         self.aider_bin = aider_bin
         self.context_search = context_search
         self.openhands_enabled = openhands_enabled
@@ -208,6 +205,27 @@ class ActionWorkflow:
             if repo_key == stripped or repo_key in stripped:
                 return repo_key
         return None
+
+    @staticmethod
+    def _extract_tier_flag(text: str) -> tuple[str, str | None]:
+        """Strip an explicit tier flag from *text* and return ``(cleaned_text, tier)``.
+
+        Users can append ``--trivial``, ``--standard``, or ``--complex`` anywhere
+        in their Slack message to bypass the LLM evaluator and force a specific
+        routing tier.  The flag is removed from the text before it is passed to
+        Aider so the coding agent never sees it.
+
+        Returns a 2-tuple of ``(cleaned_text, forced_tier)`` where *forced_tier*
+        is ``None`` when no flag is present.
+        """
+        import re
+        pattern = re.compile(r"\s*--(trivial|standard|complex)\b", re.IGNORECASE)
+        match = pattern.search(text)
+        if match is None:
+            return text, None
+        tier = match.group(1).lower()
+        cleaned = pattern.sub("", text).strip()
+        return cleaned, tier
 
     async def _get_active_thread_repo(self, request: ActionRequest) -> str | None:
         """Fetch the remembered target repository for this thread, if any."""
@@ -351,6 +369,19 @@ class ActionWorkflow:
                         message=message,
                     )
 
+            # ── Tier-flag extraction: --trivial / --standard / --complex ──
+            cleaned_request, forced_tier = self._extract_tier_flag(request.request)
+            if forced_tier is not None:
+                request = ActionRequest(
+                    channel=request.channel,
+                    thread_ts=request.thread_ts,
+                    request=cleaned_request,
+                    repository=request.repository,
+                    base_branch=request.base_branch,
+                    user_id=request.user_id,
+                )
+                logger.info("Tier flag detected: forcing tier=%s", forced_tier)
+
             eval_result = await self._evaluate_request(
                 request, active_thread_repo=active_thread_repo,
             )
@@ -393,13 +424,15 @@ class ActionWorkflow:
                 await self._save_thread_context(request, target_repo_key)
 
             optimized_prompt = eval_result.optimized_prompt or request.request
-            selected_model = self.model_tier_map.get(
-                eval_result.complexity_tier,
-                self.model_tier_map["simple"],
+            tier = forced_tier or eval_result.complexity_tier
+            executor = "OpenHands" if (tier == "complex" and self.openhands_enabled) else "Aider"
+            logger.info(
+                "Execution plan: tier=%s (forced=%s) → executor=%s",
+                tier, forced_tier is not None, executor,
             )
 
             # ── Complex task → route to OpenHands if enabled ──
-            if eval_result.complexity_tier == "complex" and self.openhands_enabled:
+            if tier == "complex" and self.openhands_enabled:
                 oh_result = await self._run_openhands(
                     request,
                     optimized_prompt=optimized_prompt,
@@ -412,7 +445,13 @@ class ActionWorkflow:
                     request, oh_result, model=self.openhands_model, target_repo_key=target_repo_key,
                 )
 
-            # ── Simple task → run Aider directly ──
+            # ── Standard task (or complex with OpenHands disabled) → Aider + Sonnet ──
+            # ── Trivial task → Aider + Groq/Llama ──
+            if tier == "trivial":
+                selected_model = self.aider_model_trivial
+            else:
+                selected_model = self.aider_model_standard
+
             aider_result = await self._run_aider(
                 request,
                 optimized_prompt=optimized_prompt,
@@ -529,11 +568,15 @@ class ActionWorkflow:
             logger.warning("Failed to post PR comment notification to Slack", exc_info=True)
 
         # 3. Evaluate the comment through the pre-flight evaluator
+        cleaned_comment, forced_tier = self._extract_tier_flag(comment_body)
         synthetic_request = ActionRequest(
             channel=channel_id,
             thread_ts=thread_ts,
-            request=comment_body,
+            request=cleaned_comment,
         )
+        if forced_tier is not None:
+            logger.info("Tier flag detected in PR comment: forcing tier=%s", forced_tier)
+
         eval_result = await self._evaluate_request(synthetic_request)
 
         if not eval_result.is_actionable:
@@ -552,14 +595,16 @@ class ActionWorkflow:
                 logger.warning("Failed to post clarification to Slack", exc_info=True)
             return
 
-        optimized_prompt = eval_result.optimized_prompt or comment_body
-        selected_model = self.model_tier_map.get(
-            eval_result.complexity_tier,
-            self.model_tier_map["simple"],
+        optimized_prompt = eval_result.optimized_prompt or cleaned_comment
+        tier = forced_tier or eval_result.complexity_tier
+        executor = "OpenHands" if (tier == "complex" and self.openhands_enabled) else "Aider"
+        logger.info(
+            "Execution plan: tier=%s (forced=%s) → executor=%s",
+            tier, forced_tier is not None, executor,
         )
 
         # 4. Complex → route to OpenHands if enabled
-        if eval_result.complexity_tier == "complex" and self.openhands_enabled:
+        if tier == "complex" and self.openhands_enabled:
             oh_result = await self._run_openhands(
                 synthetic_request,
                 optimized_prompt=optimized_prompt,
@@ -575,9 +620,10 @@ class ActionWorkflow:
                 )
             return
 
-        # 5. Simple → run Aider on existing branch
+        # 5. Trivial/Standard → run Aider on existing branch
         #    Acquire a per-branch lock so concurrent review comments for the
         #    same branch are serialized instead of fighting over git locks.
+        selected_model = self.aider_model_trivial if tier == "trivial" else self.aider_model_standard
         async with self._branch_lock(branch_name):
             try:
                 aider_result = await self._run_aider(
@@ -762,8 +808,23 @@ class ActionWorkflow:
             "Content-Type": "application/json",
         }
 
+        # Append explicit push instructions so OpenHands pushes changes
+        # back to GitHub on a named branch.  The conversation status
+        # endpoint is unreliable (stays RUNNING even after the agent
+        # finishes), so we also rely on the events stream to detect
+        # completion.
+        push_instructions = (
+            f"\n\nIMPORTANT — after you have finished making all changes, "
+            f"you MUST push them to GitHub so a pull request can be created:\n"
+            f"  git checkout -b {branch_name}\n"
+            f"  git add -A\n"
+            f"  git commit -m \"AI: <short summary of changes>\"\n"
+            f"  git push origin {branch_name}\n"
+            f"Do NOT skip the push step."
+        )
+
         payload = {
-            "initial_user_msg": optimized_prompt,
+            "initial_user_msg": optimized_prompt + push_instructions,
             "repository": repository,
         }
 
@@ -779,12 +840,45 @@ class ActionWorkflow:
             )
 
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-                # 0. Register the GitHub token so OpenHands can access the repo.
-                #    The V0 ``/api/conversations`` endpoint reads provider tokens
-                #    from OpenHands' secrets store via ``get_provider_tokens``.
-                #    Without this step the server raises:
-                #      TypeError: provider_tokens must be a MappingProxyType, got NoneType
+            # Two timeout profiles:
+            # - short: for quick API calls (token registration, conversation start)
+            # - long:  for status polling while the agent works
+            short_timeout = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
+            long_timeout = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
+
+            async with httpx.AsyncClient(timeout=short_timeout) as client:
+                # 0a. Quick connectivity check — fail fast if the server is
+                #     completely unresponsive (e.g. building a Docker image and
+                #     blocking all requests).
+                try:
+                    probe = await client.get(
+                        f"{self.openhands_url}/api/options/config",
+                        headers=headers,
+                    )
+                    logger.info(
+                        "OpenHands server reachable (HTTP %s)", probe.status_code,
+                    )
+                except (httpx.TimeoutException, httpx.NetworkError) as probe_err:
+                    logger.error(
+                        "OpenHands server is not responding: %s", probe_err,
+                    )
+                    return AiderResult(
+                        branch_name=branch_name,
+                        stdout="",
+                        stderr=(
+                            f"OpenHands server at {self.openhands_url} is not responding "
+                            f"({type(probe_err).__name__}). It may be busy building a "
+                            f"sandbox image from a previous task — please try again in "
+                            f"a few minutes."
+                        ),
+                        returncode=1,
+                    )
+
+                # 0b. Register the GitHub token so OpenHands can access the repo.
+                #     The V0 ``/api/conversations`` endpoint reads provider tokens
+                #     from OpenHands' secrets store via ``get_provider_tokens``.
+                #     Without this step the server raises:
+                #       TypeError: provider_tokens must be a MappingProxyType, got NoneType
                 provider_payload = {
                     "provider_tokens": {
                         "github": {
@@ -793,32 +887,50 @@ class ActionWorkflow:
                         },
                     },
                 }
-                logger.info(
-                    "Registering GitHub token with OpenHands at %s/api/add-git-providers",
-                    self.openhands_url,
-                )
-                token_resp = await client.post(
-                    f"{self.openhands_url}/api/add-git-providers",
-                    headers=headers,
-                    json=provider_payload,
-                )
-                if token_resp.status_code != 200:
-                    logger.error(
-                        "OpenHands add-git-providers failed (HTTP %s): %s",
-                        token_resp.status_code, token_resp.text,
+                token_registered = False
+                last_token_error = ""
+                for attempt in range(1, 4):  # up to 3 attempts
+                    logger.info(
+                        "Registering GitHub token with OpenHands (attempt %d)",
+                        attempt,
                     )
+                    try:
+                        token_resp = await client.post(
+                            f"{self.openhands_url}/api/add-git-providers",
+                            headers=headers,
+                            json=provider_payload,
+                        )
+                        if token_resp.status_code == 200:
+                            token_registered = True
+                            logger.info("Registered GitHub token with OpenHands successfully")
+                            break
+                        last_token_error = (
+                            f"HTTP {token_resp.status_code}: {token_resp.text}"
+                        )
+                        logger.warning(
+                            "OpenHands add-git-providers attempt %d failed: %s",
+                            attempt, last_token_error,
+                        )
+                    except (httpx.TimeoutException, httpx.NetworkError) as reg_err:
+                        last_token_error = f"{type(reg_err).__name__}: {reg_err}"
+                        logger.warning(
+                            "OpenHands add-git-providers attempt %d timed out: %s",
+                            attempt, last_token_error,
+                        )
+                    if attempt < 3:
+                        await asyncio.sleep(15 * attempt)  # 15s, 30s backoff
+
+                if not token_registered:
                     return AiderResult(
                         branch_name=branch_name,
                         stdout="",
                         stderr=(
-                            f"Failed to register GitHub token with OpenHands "
-                            f"(HTTP {token_resp.status_code}): {token_resp.text}. "
-                            f"The token may be invalid or OpenHands cannot reach "
-                            f"GitHub to validate it."
+                            f"Failed to register GitHub token with OpenHands after 3 attempts. "
+                            f"Last error: {last_token_error}. "
+                            f"The server may be overloaded or the token is invalid."
                         ),
                         returncode=1,
                     )
-                logger.info("Registered GitHub token with OpenHands successfully")
 
                 # 1. Start the conversation
                 resp = await client.post(
@@ -839,24 +951,103 @@ class ActionWorkflow:
                 )
 
                 # 2. Poll for completion (max ~60 min with 15s intervals)
+                #    Switch to the long timeout profile for polling — the
+                #    server can be slow to respond while the agent is working.
+                client.timeout = long_timeout
                 max_polls = 240
                 poll_interval = 15
                 final_status = "UNKNOWN"
+                agent_finished = False
                 # Post a Slack update every ~5 minutes so the user knows
                 # the agent is still working.
                 polls_between_updates = 20  # 20 × 15s = 5 min
                 last_reported_status: str | None = None
+                # If every poll fails consecutively AND the events stream
+                # also can't confirm the agent finished, give up early.
+                # When only the metadata file is corrupted (OpenHands bug:
+                # JSONDecodeError / 500), the events endpoint is served from
+                # a different code path and may still work — so we fall back
+                # to it before giving up.
+                consecutive_failures = 0
+                max_consecutive_failures = 10  # ~2.5 min of solid failures
+                # Track which event we've seen so far for pagination.
+                last_event_id = 0
 
                 for poll_num in range(1, max_polls + 1):
                     await asyncio.sleep(poll_interval)
 
-                    status_resp = await client.get(
-                        f"{self.openhands_url}/api/conversations/{conversation_id}",
-                        headers=headers,
-                    )
-                    status_resp.raise_for_status()
-                    status_data = status_resp.json()
-                    final_status = status_data.get("status", "UNKNOWN")
+                    # Tolerate transient timeouts / errors on status polls.
+                    # The OpenHands server may be slow while building sandbox
+                    # images or under heavy load; a single failed poll should
+                    # not abort the entire conversation.
+                    try:
+                        status_resp = await client.get(
+                            f"{self.openhands_url}/api/conversations/{conversation_id}",
+                            headers=headers,
+                        )
+                        status_resp.raise_for_status()
+                        status_data = status_resp.json()
+                        final_status = status_data.get("status", "UNKNOWN")
+                        consecutive_failures = 0  # reset on success
+                    except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError) as poll_err:
+                        consecutive_failures += 1
+                        logger.warning(
+                            "OpenHands poll %d failed (%d/%d consecutive, will retry): %s",
+                            poll_num, consecutive_failures, max_consecutive_failures, poll_err,
+                        )
+                        # Fallback: when the metadata endpoint fails (e.g. a
+                        # corrupted metadata file causes a 500), the events
+                        # endpoint is independent and may still be healthy.
+                        # Check it now so we don't miss a finished signal.
+                        try:
+                            events_resp = await client.get(
+                                f"{self.openhands_url}/api/conversations/{conversation_id}/events",
+                                headers=headers,
+                                params={"start_id": last_event_id, "limit": 50},
+                            )
+                            if events_resp.status_code == 200:
+                                fb_events = events_resp.json()
+                                if isinstance(fb_events, dict):
+                                    fb_events = fb_events.get("events", [])
+                                for evt in fb_events:
+                                    evt_id = evt.get("id", 0)
+                                    if evt_id > last_event_id:
+                                        last_event_id = evt_id
+                                    extras = evt.get("extras", {})
+                                    obs = evt.get("observation", "")
+                                    if (
+                                        obs == "agent_state_changed"
+                                        and extras.get("agent_state") in ("finished", "stopped")
+                                    ):
+                                        logger.info(
+                                            "OpenHands agent state → %s "
+                                            "(detected via events despite metadata 500)",
+                                            extras["agent_state"],
+                                        )
+                                        agent_finished = True
+                                        break
+                        except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError):
+                            pass  # events also unavailable; rely on consecutive_failures counter
+
+                        if agent_finished:
+                            break
+
+                        if consecutive_failures >= max_consecutive_failures:
+                            logger.error(
+                                "OpenHands conversation %s: %d consecutive poll failures — giving up",
+                                conversation_id, consecutive_failures,
+                            )
+                            return AiderResult(
+                                branch_name=branch_name,
+                                stdout="",
+                                stderr=(
+                                    f"OpenHands conversation {conversation_id} is unreachable "
+                                    f"({consecutive_failures} consecutive poll failures). "
+                                    f"The conversation metadata may be corrupted on the server."
+                                ),
+                                returncode=1,
+                            )
+                        continue
 
                     logger.info(
                         "OpenHands conversation %s status: %s",
@@ -864,6 +1055,43 @@ class ActionWorkflow:
                     )
 
                     if final_status in ("STOPPED", "ERROR"):
+                        break
+
+                    # The conversation status endpoint often stays RUNNING
+                    # even after the agent finishes.  Check the events
+                    # stream for an authoritative agent_state_changed →
+                    # finished/stopped signal.
+                    if final_status == "RUNNING":
+                        try:
+                            events_resp = await client.get(
+                                f"{self.openhands_url}/api/conversations/{conversation_id}/events",
+                                headers=headers,
+                                params={"start_id": last_event_id, "limit": 50},
+                            )
+                            if events_resp.status_code == 200:
+                                events = events_resp.json()
+                                if isinstance(events, dict):
+                                    events = events.get("events", [])
+                                for evt in events:
+                                    evt_id = evt.get("id", 0)
+                                    if evt_id > last_event_id:
+                                        last_event_id = evt_id
+                                    extras = evt.get("extras", {})
+                                    obs = evt.get("observation", "")
+                                    if (
+                                        obs == "agent_state_changed"
+                                        and extras.get("agent_state") in ("finished", "stopped")
+                                    ):
+                                        logger.info(
+                                            "OpenHands agent state → %s (detected via events)",
+                                            extras["agent_state"],
+                                        )
+                                        agent_finished = True
+                                        break
+                        except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError):
+                            pass  # non-critical; we'll retry next cycle
+
+                    if agent_finished:
                         break
 
                     # Post periodic "still working" updates to Slack
@@ -883,7 +1111,7 @@ class ActionWorkflow:
                 f"{self.openhands_url}/conversations/{conversation_id}"
             )
 
-            if final_status == "STOPPED":
+            if final_status == "STOPPED" or agent_finished:
                 return AiderResult(
                     branch_name=branch_name,
                     stdout=f"OpenHands completed. Conversation: {conversation_link}",
@@ -955,9 +1183,12 @@ class ActionWorkflow:
         env.setdefault("TOKENIZERS_PARALLELISM", "false")
         return env
 
-    _GIT_TIMEOUT = 120  # seconds
-    _AIDER_TIMEOUT = 600  # 10 minutes
-    _TEST_TIMEOUT = 300  # 5 minutes
+    _GIT_TIMEOUT = 120   # seconds
+    _AIDER_TIMEOUT = 1800  # 30 minutes
+    _TEST_TIMEOUT = 600   # 10 minutes
+    _STALL_SECONDS = 15   # how long to wait with no output before assuming a prompt
+    _USER_REPLY_TIMEOUT = 300  # 5 min to wait for the user's Slack reply
+    _REPLY_POLL_INTERVAL = 5   # poll Slack every 5s for new messages
 
     async def _git(self, *args: str, cwd: str | None = None) -> subprocess.CompletedProcess[str]:
         """Run a git command in an explicit *cwd* (required for stateless mode)."""
@@ -982,6 +1213,173 @@ class ActionWorkflow:
             )
         logger.debug("git %s → exit %d", args[0] if args else "?", result.returncode)
         return result
+
+    # ------------------------------------------------------------------
+    # Interactive Aider subprocess
+    # ------------------------------------------------------------------
+
+    async def _run_aider_subprocess(
+        self,
+        cmd: list[str],
+        *,
+        cwd: str,
+        env: dict[str, str],
+        channel: str | None = None,
+        thread_ts: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run an Aider command with interactive stall detection.
+
+        When *channel* and *thread_ts* are provided and the process produces
+        no new output for ``_STALL_SECONDS``, the last chunk of output is
+        forwarded to the Slack thread as a prompt.  The method then polls
+        ``fetch_replies`` for a user response and pipes it into stdin.
+
+        If Slack integration details are not provided, the process runs with
+        ``stdin`` closed (equivalent to the old ``subprocess.DEVNULL`` mode).
+        """
+        interactive = channel is not None and thread_ts is not None
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.PIPE if interactive else asyncio.subprocess.DEVNULL,
+            cwd=cwd,
+            env=env,
+        )
+
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+        last_output_time = asyncio.get_event_loop().time()
+        # Track the latest Slack message ts we've already seen so we don't
+        # re-read old replies when polling.
+        last_seen_ts: str | None = None
+
+        async def _read_stream(
+            stream: asyncio.StreamReader | None,
+            dest: list[str],
+        ) -> None:
+            nonlocal last_output_time
+            if stream is None:
+                return
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(stream.read(4096), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                if not chunk:
+                    break
+                text = chunk.decode("utf-8", errors="replace")
+                dest.append(text)
+                last_output_time = asyncio.get_event_loop().time()
+
+        async def _monitor() -> None:
+            """Detect stalls and relay prompts to Slack."""
+            nonlocal last_seen_ts, last_output_time
+            if not interactive:
+                return
+            assert channel is not None and thread_ts is not None  # for type checker
+            while proc.returncode is None:
+                await asyncio.sleep(1)
+                elapsed = asyncio.get_event_loop().time() - last_output_time
+                if elapsed < self._STALL_SECONDS:
+                    continue
+
+                # Aider has been silent – likely waiting for input.
+                recent_output = "".join(stdout_chunks[-5:])[-2000:]
+                if not recent_output.strip():
+                    continue
+
+                prompt_msg = (
+                    ":robot_face: Aider is waiting for input:\n"
+                    f"```\n{recent_output}\n```\n"
+                    "Reply in this thread to continue, or say `abort` to cancel."
+                )
+                await self.slack.post_message(channel, prompt_msg, thread_ts=thread_ts)
+
+                # Poll Slack for a reply
+                reply_text = await self._wait_for_slack_reply(
+                    channel, thread_ts, after_ts=last_seen_ts,
+                )
+                if reply_text is None or reply_text.strip().lower() == "abort":
+                    logger.info("User aborted interactive Aider session")
+                    proc.kill()
+                    return
+
+                last_seen_ts = str(asyncio.get_event_loop().time())
+                # Feed user reply into Aider's stdin
+                if proc.stdin is not None:
+                    proc.stdin.write((reply_text + "\n").encode())
+                    await proc.stdin.drain()
+                last_output_time = asyncio.get_event_loop().time()
+
+        # Run readers + monitor concurrently; overall timeout applies.
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    _read_stream(proc.stdout, stdout_chunks),
+                    _read_stream(proc.stderr, stderr_chunks),
+                    _monitor(),
+                ),
+                timeout=self._AIDER_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.error("Aider timed out after %ds", self._AIDER_TIMEOUT)
+            proc.kill()
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=1,
+                stdout="",
+                stderr=f"[bot] Aider timed out after {self._AIDER_TIMEOUT}s",
+            )
+
+        await proc.wait()
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=proc.returncode or 0,
+            stdout="".join(stdout_chunks),
+            stderr="".join(stderr_chunks),
+        )
+
+    async def _wait_for_slack_reply(
+        self,
+        channel: str,
+        thread_ts: str,
+        *,
+        after_ts: str | None = None,
+    ) -> str | None:
+        """Poll the Slack thread for a new human reply.
+
+        Returns the reply text, or ``None`` if ``_USER_REPLY_TIMEOUT`` elapses.
+        """
+        deadline = asyncio.get_event_loop().time() + self._USER_REPLY_TIMEOUT
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                messages = await self.slack.fetch_replies(
+                    channel, thread_ts, oldest=after_ts,
+                )
+            except Exception as exc:
+                # Permanent Slack API errors (e.g. missing_scope, channel_not_found)
+                # will never succeed on retry — abort immediately.
+                _PERMANENT_ERRORS = ("missing_scope", "channel_not_found", "invalid_auth", "not_authed", "account_inactive")
+                exc_str = str(exc)
+                if any(err in exc_str for err in _PERMANENT_ERRORS):
+                    logger.error("Permanent Slack API error — aborting reply poll: %s", exc)
+                    return None
+                logger.warning("fetch_replies failed; will retry", exc_info=True)
+                await asyncio.sleep(self._REPLY_POLL_INTERVAL)
+                continue
+
+            # Look for human messages (no bot_id) that are newer than our prompt
+            for msg in reversed(messages):
+                if msg.get("bot_id"):
+                    continue
+                return msg.get("text", "")
+
+            await asyncio.sleep(self._REPLY_POLL_INTERVAL)
+
+        logger.warning("Timed out waiting for Slack reply after %ds", self._USER_REPLY_TIMEOUT)
+        return None
 
     # ------------------------------------------------------------------
     # Test validation helpers
@@ -1026,6 +1424,12 @@ class ActionWorkflow:
                 env=env,
                 timeout=self._INSTALL_TIMEOUT,
             )
+        except FileNotFoundError:
+            logger.warning(
+                "Package manager %r not found on PATH; skipping dependency install",
+                install_cmd[0],
+            )
+            return None
         except subprocess.TimeoutExpired:
             logger.error("Dependency install timed out after %ds: %s", self._INSTALL_TIMEOUT, install_cmd)
             return subprocess.CompletedProcess(
@@ -1082,6 +1486,17 @@ class ActionWorkflow:
                 cwd=work_dir,
                 env=env,
                 timeout=self._TEST_TIMEOUT,
+            )
+        except FileNotFoundError:
+            logger.warning(
+                "Test runner %r not found on PATH; skipping test suite",
+                test_cmd[0],
+            )
+            return subprocess.CompletedProcess(
+                args=test_cmd,
+                returncode=0,
+                stdout="",
+                stderr=f"[bot] Test runner '{test_cmd[0]}' not found on PATH; skipped",
             )
         except subprocess.TimeoutExpired:
             logger.error("Test command timed out after %ds: %s", self._TEST_TIMEOUT, test_cmd)
@@ -1272,24 +1687,13 @@ class ActionWorkflow:
                 "channel": request.channel,
             },
         )
-        try:
-            aider_proc: subprocess.CompletedProcess[str] = await asyncio.to_thread(
-                subprocess.run,
-                aider_cmd,
-                capture_output=True,
-                text=True,
-                cwd=work_dir,
-                env=subprocess_env,
-                timeout=self._AIDER_TIMEOUT,
-            )
-        except subprocess.TimeoutExpired:
-            logger.error("Aider timed out after %ds", self._AIDER_TIMEOUT)
-            aider_proc = subprocess.CompletedProcess(
-                args=aider_cmd,
-                returncode=1,
-                stdout="",
-                stderr=f"[bot] Aider timed out after {self._AIDER_TIMEOUT}s",
-            )
+        aider_proc = await self._run_aider_subprocess(
+            aider_cmd,
+            cwd=work_dir,
+            env=subprocess_env,
+            channel=request.channel,
+            thread_ts=request.thread_ts,
+        )
 
         # 2b. Check if Aider failed or made no changes.
         logger.info(
@@ -1389,18 +1793,13 @@ class ActionWorkflow:
                         "--no-show-model-warnings",
                         "--message", fix_prompt,
                     ]
-                    try:
-                        await asyncio.to_thread(
-                            subprocess.run,
-                            retry_cmd,
-                            capture_output=True,
-                            text=True,
-                            cwd=work_dir,
-                            env=subprocess_env,
-                            timeout=self._AIDER_TIMEOUT,
-                        )
-                    except subprocess.TimeoutExpired:
-                        logger.error("Aider retry timed out after %ds", self._AIDER_TIMEOUT)
+                    await self._run_aider_subprocess(
+                        retry_cmd,
+                        cwd=work_dir,
+                        env=subprocess_env,
+                        channel=request.channel,
+                        thread_ts=request.thread_ts,
+                    )
             else:
                 # All attempts exhausted — tests still failing
                 logger.error(
@@ -1463,14 +1862,36 @@ class ActionWorkflow:
         target_repo_key: str | None = None,
     ) -> ActionRouteResult:
         branch_name = aider_result.branch_name
-        pr_url = await self.git.create_pull_request(
-            PullRequestDraft(
-                title=f"AI Update: {request.request[:72]}",
-                body=self._build_pr_body(request, aider_result),
+        try:
+            pr_url = await self.git.create_pull_request(
+                PullRequestDraft(
+                    title=f"AI Update: {request.request[:72]}",
+                    body=self._build_pr_body(request, aider_result),
+                    branch_name=branch_name,
+                ),
+                repository=target_repo_key,
+            )
+        except Exception as pr_err:
+            logger.error(
+                "Failed to create PR for branch %s: %s",
+                branch_name, pr_err,
+            )
+            # The agent may not have pushed the branch.  Inform the user
+            # so they can investigate the OpenHands conversation directly.
+            provider_label = model or "agent"
+            await self._post_message(
+                request,
+                f":warning: {provider_label} completed the task but I couldn't "
+                f"create a PR for branch `{branch_name}`. "
+                f"The agent may not have pushed the branch to GitHub.\n"
+                f"Error: {pr_err}",
+            )
+            return ActionRouteResult(
+                status="error",
+                provider=model or "aider",
+                message=f"PR creation failed: {pr_err}",
                 branch_name=branch_name,
-            ),
-            repository=target_repo_key,
-        )
+            )
 
         # Persist the PR → Slack thread mapping so we can handle PR comments
         await self._save_pr_mapping(
@@ -1484,16 +1905,17 @@ class ActionWorkflow:
         if target_repo_key:
             await self._save_repository_config(repository=target_repo_key)
 
+        provider_label = model or "aider"
         model_info = f"\n_Model: `{model}`_" if model else ""
         message = (
-            f":white_check_mark: Aider pushed `{branch_name}` and opened a PR.\n"
+            f":white_check_mark: {provider_label} pushed `{branch_name}` and opened a PR.\n"
             f"PR: {pr_url}"
             f"{model_info}"
         )
         await self._post_message(request, message)
         return ActionRouteResult(
             status="completed",
-            provider=model or "aider",
+            provider=provider_label,
             message=message,
             pr_url=pr_url,
             branch_name=branch_name,

@@ -55,6 +55,20 @@ class StubSlackGateway(SlackGateway):
             extra={"channel": channel, "ts": ts},
         )
 
+    async def fetch_replies(
+        self,
+        channel: str,
+        thread_ts: str,
+        *,
+        oldest: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        logger.info(
+            "Stub Slack fetch_replies invoked",
+            extra={"channel": channel, "thread_ts": thread_ts},
+        )
+        return []
+
 
 class StubContextSearch(ContextSearch):
     async def match_chunks(

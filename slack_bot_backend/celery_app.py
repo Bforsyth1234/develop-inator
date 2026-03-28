@@ -130,7 +130,7 @@ def process_pr_comment_task(
     # blocking_timeout = max time a queued task waits to acquire the lock.
     redis_client = _get_redis_client()
     lock_key = f"pr-comment-lock:{pr_url}"
-    lock = redis_client.lock(lock_key, timeout=600, blocking_timeout=600)
+    lock = redis_client.lock(lock_key, timeout=1800, blocking_timeout=1800)
 
     try:
         acquired = lock.acquire(blocking=True)

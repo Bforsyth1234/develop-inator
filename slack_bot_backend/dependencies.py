@@ -263,10 +263,8 @@ def _build_action_workflow(
         github_token=github_token,
         repo_map=repo_map,
         supabase=supabase,
-        model_tier_map={
-            "simple": settings.aider_model_simple,
-            "complex": settings.aider_model_complex,
-        },
+        aider_model_trivial=settings.aider_model_trivial,
+        aider_model_standard=settings.aider_model_standard,
         context_search=context_search,
         openhands_enabled=settings.openhands_enabled,
         openhands_model=settings.openhands_model,

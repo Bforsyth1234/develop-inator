@@ -82,10 +82,10 @@ class _NoOpGit:
 
 
 _CATEGORY_TO_TIER: dict[str, str] = {
-    "bugfix": "simple",
-    "feature": "simple",
-    "refactor": "simple",
-    "performance": "simple",
+    "bugfix": "standard",
+    "feature": "standard",
+    "refactor": "standard",
+    "performance": "standard",
 }
 
 

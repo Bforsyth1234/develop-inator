@@ -55,6 +55,15 @@ class SlackGateway(Protocol):
         blocks: list[dict] | None = None,
     ) -> None: ...
 
+    async def fetch_replies(
+        self,
+        channel: str,
+        thread_ts: str,
+        *,
+        oldest: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]: ...
+
 
 class ContextSearch(Protocol):
     """Semantic search over documentation / codebase context.

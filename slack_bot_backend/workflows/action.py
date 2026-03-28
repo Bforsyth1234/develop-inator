@@ -132,6 +132,34 @@ purple shades). Tell Aider to explore the codebase to find the right files.
 User's request:
 {user_request}"""
 
+# ---------------------------------------------------------------------------
+# PR comment classifier prompt
+# ---------------------------------------------------------------------------
+# Used to decide whether a GitHub PR comment is actionable feedback that
+# requires code changes vs. an informational summary (e.g. an automated
+# "here's what changed" comment posted when a PR is opened or pushed).
+
+_PR_COMMENT_CLASSIFIER_PROMPT = """\
+You are a classifier for GitHub pull-request comments.
+
+Your ONLY job is to decide whether the following comment is:
+
+  "actionable"   — it requests a code change, flags a bug, asks for a fix,
+                    suggests an improvement, or asks a question that implies
+                    the code should be modified.
+
+  "summary"      — it is an informational summary of the PR changes, an
+                    automated description, a CI status report, a review
+                    approval/rejection with no specific change request, or
+                    any other comment that does NOT ask for a code change.
+
+Respond with ONLY a JSON object (no markdown fences):
+
+{{"classification": "actionable" | "summary"}}
+
+Comment to classify:
+{comment_body}"""
+
 
 class ActionGitOperations(Protocol):
     """Minimal git interface required by the action workflow."""
@@ -478,6 +506,42 @@ class ActionWorkflow:
             return ActionRouteResult(status="error", provider="error", message=message)
 
     # ------------------------------------------------------------------
+    # PR comment classifier (summary vs actionable)
+    # ------------------------------------------------------------------
+
+    async def _is_actionable_comment(self, comment_body: str) -> bool:
+        """Use the LLM to decide if a PR comment is actionable feedback.
+
+        Returns ``True`` when the comment requests a code change and
+        ``False`` when it is an informational summary, CI report, or
+        approval that does not require action.  Falls back to ``True``
+        (fail-open) if the LLM is unavailable or returns unparseable output.
+        """
+        prompt = _PR_COMMENT_CLASSIFIER_PROMPT.format(comment_body=comment_body)
+        try:
+            result = await self.llm.generate(prompt)
+            text = result.content.strip()
+            # Strip markdown fences if present
+            if text.startswith("```"):
+                lines = text.splitlines()
+                inner = lines[1:-1] if lines and lines[-1].strip() == "```" else lines[1:]
+                text = "\n".join(inner)
+            data = json.loads(text)
+            classification = data.get("classification", "actionable")
+            logger.info(
+                "PR comment classified as %s",
+                classification,
+                extra={"classification": classification},
+            )
+            return classification == "actionable"
+        except Exception:
+            logger.warning(
+                "PR comment classifier failed; defaulting to actionable",
+                exc_info=True,
+            )
+            return True
+
+    # ------------------------------------------------------------------
     # PR comment handler (GitHub webhook → Slack → Aider)
     # ------------------------------------------------------------------
 
@@ -553,6 +617,14 @@ class ActionWorkflow:
                 )
             except Exception:
                 logger.warning("Failed to post error to Slack", exc_info=True)
+            return
+
+        # 1b. Classify the comment — skip pure summaries / informational posts
+        if not await self._is_actionable_comment(comment_body):
+            logger.info(
+                "PR comment classified as summary; skipping",
+                extra={"pr_url": pr_url, "sender": sender},
+            )
             return
 
         # 2. Notify Slack thread
@@ -1710,7 +1782,19 @@ class ActionWorkflow:
 
         # Check for uncommitted changes (staged or unstaged)
         diff_proc = await self._git("status", "--porcelain", cwd=work_dir)
-        has_uncommitted = bool(diff_proc.stdout.strip())
+        changed_files = [
+            line.strip().split(maxsplit=1)[-1]
+            for line in diff_proc.stdout.strip().splitlines()
+            if line.strip()
+        ]
+        # Aider always creates/modifies .gitignore and .aider* housekeeping
+        # files.  Ignore these when deciding whether real work was done.
+        _AIDER_HOUSEKEEPING = {".gitignore", ".aider.tags.cache.v0/cache.db"}
+        real_changes = [
+            f for f in changed_files
+            if f not in _AIDER_HOUSEKEEPING and not f.startswith(".aider")
+        ]
+        has_uncommitted = bool(real_changes)
 
         if aider_proc.returncode != 0 or (not aider_made_commits and not has_uncommitted):
             reason = (

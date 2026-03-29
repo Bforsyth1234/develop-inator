@@ -98,3 +98,4 @@ class ActionExecution(BaseModel):
     generated_spec: str
     status: ActionExecutionStatus = "pending"
     model: str | None = None
+    executor: str = "aider"  # "aider" or "openhands"

@@ -16,6 +16,7 @@ from slack_bot_backend.celery_app import (
     process_github_webhook_task,
     process_pr_comment_task,
     process_slack_mention_task,
+    process_spec_approval_task,
 )
 from slack_bot_backend.config import Settings
 from slack_bot_backend.dependencies import ServiceContainer, get_container
@@ -313,6 +314,67 @@ async def _handle_review_comment(
     return {"ok": True, "message": "pr review comment handler scheduled"}
 
 
+async def _handle_spec_action(
+    container: ServiceContainer,
+    payload: dict,
+) -> dict[str, object]:
+    """Process approve_spec / reject_spec button clicks."""
+    actions = payload.get("actions", [])
+    if not actions:
+        return {"ok": True}
+
+    action = actions[0]
+    action_id: str = action.get("action_id", "")
+    execution_id: str = action.get("value", "")
+
+    if not execution_id:
+        return {"ok": True}
+
+    execution = await container.supabase.get_action_execution(execution_id)
+    if execution is None:
+        logger.warning("Interaction for unknown execution %s", execution_id)
+        return {"ok": True}
+
+    if action_id == "approve_spec":
+        await container.supabase.update_action_execution_status(execution_id, "approved")
+
+        # Update the original Slack message to reflect approval
+        message_container = payload.get("container", {})
+        message_ts = message_container.get("message_ts", "")
+        if message_ts:
+            try:
+                await container.slack.update_message(
+                    execution.channel,
+                    message_ts,
+                    ":white_check_mark: Spec approved — executing…",
+                )
+            except Exception:
+                logger.warning("Could not update approval message", exc_info=True)
+
+        # Kick off Aider execution via Celery task
+        process_spec_approval_task.apply_async(
+            kwargs={"execution_id": execution_id},
+        )
+        return {"ok": True}
+
+    if action_id == "reject_spec":
+        await container.supabase.update_action_execution_status(execution_id, "rejected")
+        message_container = payload.get("container", {})
+        message_ts = message_container.get("message_ts", "")
+        if message_ts:
+            try:
+                await container.slack.update_message(
+                    execution.channel,
+                    message_ts,
+                    ":x: Spec rejected. Reply in the thread with feedback to generate a new one.",
+                )
+            except Exception:
+                logger.warning("Could not update rejection message", exc_info=True)
+        return {"ok": True}
+
+    return {"ok": True}
+
+
 @router.post("/slack/interactions", tags=["slack"])
 async def handle_slack_interactions(
     request: Request,
@@ -333,5 +395,9 @@ async def handle_slack_interactions(
         payload = json.loads(raw_payload)
     except (json.JSONDecodeError, TypeError) as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON payload") from exc
+
+    interaction_type = payload.get("type", "")
+    if interaction_type == "block_actions":
+        return await _handle_spec_action(container, payload)
 
     return {"ok": True}

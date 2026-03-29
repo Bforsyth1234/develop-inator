@@ -755,8 +755,8 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
         model_idx = aider_cmd.index("--model") + 1
         self.assertEqual(aider_cmd[model_idx], _DEFAULT_STANDARD_MODEL)
 
-    async def test_complex_tier_routes_to_openhands_when_enabled(self) -> None:
-        """A 'complex' complexity_tier invokes OpenHands when openhands_enabled=True."""
+    async def test_complex_tier_routes_to_planner_when_openhands_enabled(self) -> None:
+        """A 'complex' complexity_tier routes through planner spec flow (even with openhands_enabled)."""
         slack = FakeSlackGateway()
         git = FakeGitService()
         llm = FakeLanguageModel(evaluator_json={
@@ -781,19 +781,18 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
             openhands_api_key="test-api-key",
         )
 
-        fake_oh_result = AiderResult(
-            returncode=0,
-            stdout="OpenHands completed",
-            stderr="",
-            branch_name="ai-update-12345",
+        fake_route_result = ActionRouteResult(
+            status="completed", provider="planner", message="Spec posted.",
         )
 
-        with mock.patch.object(wf, "_run_openhands", return_value=fake_oh_result) as mock_oh:
+        with mock.patch.object(wf, "_handle_complex_plan", return_value=fake_route_result) as mock_plan:
             result = await wf.run(
                 ActionRequest(channel="C123", thread_ts="1710.2", request="Refactor auth to use NgRx")
             )
 
-        mock_oh.assert_called_once()
+        mock_plan.assert_called_once()
+        call_kwargs = mock_plan.call_args[1]
+        self.assertEqual(call_kwargs["executor"], "openhands")
         self.assertEqual(result.status, "completed")
 
     # ------------------------------------------------------------------
@@ -864,8 +863,8 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
         msg_idx = aider_cmd.index("--message") + 1
         self.assertNotIn("--standard", aider_cmd[msg_idx])
 
-    async def test_complex_flag_routes_to_openhands_when_enabled(self) -> None:
-        """--complex in the message forces OpenHands routing when openhands_enabled=True."""
+    async def test_complex_flag_routes_to_planner_when_openhands_enabled(self) -> None:
+        """--complex in the message routes through planner spec flow even when openhands_enabled=True."""
         slack = FakeSlackGateway()
         git = FakeGitService()
         # Evaluator says trivial — flag should override it
@@ -889,15 +888,18 @@ class ActionWorkflowTests(unittest.IsolatedAsyncioTestCase):
             openhands_url="https://app.all-hands.dev",
             openhands_api_key="test-api-key",
         )
-        fake_oh_result = AiderResult(
-            returncode=0, stdout="OpenHands completed", stderr="", branch_name="ai-update-12345",
+        fake_route_result = ActionRouteResult(
+            status="completed", provider="planner", message="Spec posted.",
         )
-        with mock.patch.object(wf, "_run_openhands", return_value=fake_oh_result) as mock_oh:
+        with mock.patch.object(wf, "_handle_complex_plan", return_value=fake_route_result) as mock_plan:
             result = await wf.run(
                 ActionRequest(channel="C123", thread_ts="1710.2", request="Fix the typo --complex")
             )
 
-        mock_oh.assert_called_once()
+        mock_plan.assert_called_once()
+        # Verify the executor is set to openhands since openhands_enabled=True
+        call_kwargs = mock_plan.call_args[1]
+        self.assertEqual(call_kwargs["executor"], "openhands")
         self.assertEqual(result.status, "completed")
 
     async def test_aider_subprocess_receives_env_with_api_keys(self) -> None:

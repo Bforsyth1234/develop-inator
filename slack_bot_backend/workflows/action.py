@@ -9,12 +9,14 @@ import os
 import subprocess
 import sys
 import tempfile
+import uuid
 
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 
 from slack_bot_backend.models.action import (
+    ActionExecution,
     ActionRequest,
     ActionRouteResult,
     AiderResult,
@@ -131,6 +133,32 @@ purple shades). Tell Aider to explore the codebase to find the right files.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 User's request:
 {user_request}"""
+
+# ---------------------------------------------------------------------------
+# Planner (Expert Architect) prompt — used for complex tasks
+# ---------------------------------------------------------------------------
+
+_PLANNER_SYSTEM_PROMPT = """\
+You are an Expert Software Architect. You receive a developer's request \
+and (optionally) relevant code context retrieved from the repository.
+
+Your job is to produce a *step-by-step markdown implementation spec* that \
+a coding agent (Aider) can follow to implement the change safely.
+
+Rules:
+  1. Start with a one-line **Summary** of the change.
+  2. List every file that must be created or modified, with a brief \
+description of what changes in each.
+  3. Include code snippets or pseudo-code where helpful.
+  4. Call out edge cases, migrations, or test updates needed.
+  5. Use markdown formatting (headers, bullet lists, fenced code blocks).
+  6. Be precise and concise — the coding agent will follow your spec literally.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Developer's request:
+{user_request}
+
+{rag_context}"""
 
 # ---------------------------------------------------------------------------
 # PR comment classifier prompt
@@ -453,27 +481,28 @@ class ActionWorkflow:
 
             optimized_prompt = eval_result.optimized_prompt or request.request
             tier = forced_tier or eval_result.complexity_tier
-            executor = "OpenHands" if (tier == "complex" and self.openhands_enabled) else "Aider"
+            if tier == "complex":
+                executor = "Planner → OpenHands" if self.openhands_enabled else "Planner → Aider"
+            else:
+                executor = "Aider"
             logger.info(
                 "Execution plan: tier=%s (forced=%s) → executor=%s",
                 tier, forced_tier is not None, executor,
             )
 
-            # ── Complex task → route to OpenHands if enabled ──
-            if tier == "complex" and self.openhands_enabled:
-                oh_result = await self._run_openhands(
+            # ── Complex task → always generate spec for human approval first ──
+            if tier == "complex":
+                exec_type = "openhands" if self.openhands_enabled else "aider"
+                model = self.openhands_model if self.openhands_enabled else self.aider_model_standard
+                return await self._handle_complex_plan(
                     request,
                     optimized_prompt=optimized_prompt,
-                    openhands_model=self.openhands_model,
+                    model=model,
+                    executor=exec_type,
                     target_repo_key=target_repo_key,
                 )
-                if oh_result.returncode != 0:
-                    return await self._handle_failure(request, oh_result)
-                return await self._handle_success(
-                    request, oh_result, model=self.openhands_model, target_repo_key=target_repo_key,
-                )
 
-            # ── Standard task (or complex with OpenHands disabled) → Aider + Sonnet ──
+            # ── Standard task → Aider + Sonnet ──
             # ── Trivial task → Aider + Groq/Llama ──
             if tier == "trivial":
                 selected_model = self.aider_model_trivial
@@ -669,27 +698,26 @@ class ActionWorkflow:
 
         optimized_prompt = eval_result.optimized_prompt or cleaned_comment
         tier = forced_tier or eval_result.complexity_tier
-        executor = "OpenHands" if (tier == "complex" and self.openhands_enabled) else "Aider"
+        if tier == "complex":
+            executor_label = "Planner → OpenHands" if self.openhands_enabled else "Planner → Aider"
+        else:
+            executor_label = "Aider"
         logger.info(
             "Execution plan: tier=%s (forced=%s) → executor=%s",
-            tier, forced_tier is not None, executor,
+            tier, forced_tier is not None, executor_label,
         )
 
-        # 4. Complex → route to OpenHands if enabled
-        if tier == "complex" and self.openhands_enabled:
-            oh_result = await self._run_openhands(
+        # 4. Complex → always generate spec for human approval first
+        if tier == "complex":
+            exec_type = "openhands" if self.openhands_enabled else "aider"
+            model = self.openhands_model if self.openhands_enabled else self.aider_model_standard
+            await self._handle_complex_plan(
                 synthetic_request,
                 optimized_prompt=optimized_prompt,
-                openhands_model=self.openhands_model,
+                model=model,
+                executor=exec_type,
                 target_repo_key=target_repo_key,
             )
-            if oh_result.returncode != 0:
-                await self._handle_failure(synthetic_request, oh_result)
-            else:
-                await self._handle_success(
-                    synthetic_request, oh_result,
-                    model=self.openhands_model, target_repo_key=target_repo_key,
-                )
             return
 
         # 5. Trivial/Standard → run Aider on existing branch
@@ -828,7 +856,147 @@ class ActionWorkflow:
         )
 
     # ------------------------------------------------------------------
-    # OpenHands executor (replaces the manual Planner approval flow)
+    # Complex-task planner (spec generation + approval flow)
+    # ------------------------------------------------------------------
+
+    async def _handle_complex_plan(
+        self,
+        request: ActionRequest,
+        *,
+        optimized_prompt: str,
+        model: str,
+        executor: str = "aider",
+        target_repo_key: str | None = None,
+    ) -> ActionRouteResult:
+        """Invoke the Planner LLM, persist the spec, and post Block Kit buttons."""
+        await self._post_message(
+            request,
+            ":brain: This looks like a complex change — generating an implementation spec…",
+        )
+
+        planner_prompt = _PLANNER_SYSTEM_PROMPT.format(
+            user_request=optimized_prompt,
+            rag_context="",  # TODO: inject RAG context when available
+        )
+        llm_result = await self.llm.generate(planner_prompt)
+        spec = llm_result.content
+
+        # Persist the execution so we can hydrate state on button click
+        execution_id = uuid.uuid4().hex
+        execution = ActionExecution(
+            id=execution_id,
+            channel=request.channel,
+            thread_ts=request.thread_ts,
+            user_id=request.user_id,
+            original_request=optimized_prompt,
+            generated_spec=spec,
+            status="pending",
+            model=model,
+            executor=executor,
+        )
+        if self.supabase is not None:
+            try:
+                await self.supabase.save_action_execution(execution)
+            except Exception:
+                logger.warning("Failed to persist action execution", exc_info=True)
+
+        # Post spec + approval buttons via Block Kit
+        blocks = self._build_spec_blocks(spec, execution_id)
+        try:
+            await self.slack.post_blocks(
+                request.channel,
+                blocks,
+                text="Implementation spec ready for review",
+                thread_ts=request.thread_ts,
+            )
+        except Exception:
+            logger.exception("Failed to post spec Block Kit message; falling back to plain text")
+            await self._post_message(request, f"*Implementation Spec:*\n\n{spec}")
+
+        return ActionRouteResult(
+            status="completed",
+            provider="planner",
+            message="Implementation spec posted for approval.",
+        )
+
+    async def generate_revised_spec(
+        self,
+        *,
+        old_spec: str,
+        user_feedback: str,
+        original_request: str,
+    ) -> str:
+        """Re-invoke the Planner with prior spec + user feedback to produce V2."""
+        prompt = (
+            _PLANNER_SYSTEM_PROMPT.format(
+                user_request=original_request,
+                rag_context="",
+            )
+            + f"\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Previous spec (V1):\n{old_spec}\n\n"
+            f"User feedback:\n{user_feedback}\n\n"
+            "Please produce an updated spec that incorporates the feedback."
+        )
+        llm_result = await self.llm.generate(prompt)
+        return llm_result.content
+
+    @staticmethod
+    def _split_text_into_chunks(text: str, max_len: int = 2900) -> list[str]:
+        """Split *text* into chunks of at most *max_len* characters, breaking at newlines."""
+        if len(text) <= max_len:
+            return [text]
+        chunks: list[str] = []
+        while text:
+            if len(text) <= max_len:
+                chunks.append(text)
+                break
+            # Try to break at the last newline before max_len
+            cut = text.rfind("\n", 0, max_len)
+            if cut <= 0:
+                cut = max_len
+            chunks.append(text[:cut])
+            text = text[cut:].lstrip("\n")
+        return chunks
+
+    @staticmethod
+    def _build_spec_blocks(spec: str, execution_id: str) -> list[dict]:
+        """Build Slack Block Kit blocks for the implementation spec with Approve/Reject buttons."""
+        blocks: list[dict] = [
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": ":clipboard: *Implementation Spec*"},
+            },
+        ]
+        # Split the spec across multiple section blocks (3000 char limit each)
+        for chunk in ActionWorkflow._split_text_into_chunks(spec):
+            blocks.append({
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": chunk},
+            })
+        blocks.append({"type": "divider"})
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": ":white_check_mark: Approve & Execute"},
+                    "style": "primary",
+                    "action_id": "approve_spec",
+                    "value": execution_id,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": ":x: Reject"},
+                    "style": "danger",
+                    "action_id": "reject_spec",
+                    "value": execution_id,
+                },
+            ],
+        })
+        return blocks
+
+    # ------------------------------------------------------------------
+    # OpenHands executor
     # ------------------------------------------------------------------
 
     async def _run_openhands(
@@ -930,7 +1098,7 @@ class ActionWorkflow:
                     logger.info(
                         "OpenHands server reachable (HTTP %s)", probe.status_code,
                     )
-                except (httpx.TimeoutException, httpx.NetworkError) as probe_err:
+                except (httpx.TimeoutException, httpx.NetworkError, httpx.ProtocolError) as probe_err:
                     logger.error(
                         "OpenHands server is not responding: %s", probe_err,
                     )
@@ -983,7 +1151,7 @@ class ActionWorkflow:
                             "OpenHands add-git-providers attempt %d failed: %s",
                             attempt, last_token_error,
                         )
-                    except (httpx.TimeoutException, httpx.NetworkError) as reg_err:
+                    except (httpx.TimeoutException, httpx.NetworkError, httpx.ProtocolError) as reg_err:
                         last_token_error = f"{type(reg_err).__name__}: {reg_err}"
                         logger.warning(
                             "OpenHands add-git-providers attempt %d timed out: %s",
@@ -1061,7 +1229,7 @@ class ActionWorkflow:
                         status_data = status_resp.json()
                         final_status = status_data.get("status", "UNKNOWN")
                         consecutive_failures = 0  # reset on success
-                    except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError) as poll_err:
+                    except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError, httpx.ProtocolError) as poll_err:
                         consecutive_failures += 1
                         logger.warning(
                             "OpenHands poll %d failed (%d/%d consecutive, will retry): %s",
@@ -1098,7 +1266,7 @@ class ActionWorkflow:
                                         )
                                         agent_finished = True
                                         break
-                        except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError):
+                        except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError, httpx.ProtocolError):
                             pass  # events also unavailable; rely on consecutive_failures counter
 
                         if agent_finished:
@@ -1160,7 +1328,7 @@ class ActionWorkflow:
                                         )
                                         agent_finished = True
                                         break
-                        except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError):
+                        except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError, httpx.ProtocolError):
                             pass  # non-critical; we'll retry next cycle
 
                     if agent_finished:

@@ -183,22 +183,29 @@ class GitHubGitService:
             },
         )
         # 422 usually means a PR already exists for this head branch.
-        # Look it up and return the existing URL instead of crashing.
+        # Look it up, update its title/body to reflect the latest request,
+        # and return the existing URL instead of crashing.
         if response.status_code == 422:
-            existing_url = await self._find_existing_pr(repository, draft.branch_name)
-            if existing_url:
+            existing = await self._find_existing_pr(repository, draft.branch_name)
+            if existing:
+                pr_url, pr_number = existing
                 logger.info(
-                    "PR already exists for branch %s, returning existing URL",
-                    draft.branch_name,
+                    "PR already exists for branch %s (#%s), updating title/body",
+                    draft.branch_name, pr_number,
                 )
-                return existing_url
+                await self._update_pull_request(
+                    repository, pr_number, title=draft.title, body=draft.body,
+                )
+                return pr_url
             # Not a duplicate-PR 422 — raise the original error.
             response.raise_for_status()
         response.raise_for_status()
         return response.json()["html_url"]
 
-    async def _find_existing_pr(self, repository: str, head_branch: str) -> str | None:
-        """Find an open PR for *head_branch* and return its ``html_url``, or ``None``."""
+    async def _find_existing_pr(
+        self, repository: str, head_branch: str,
+    ) -> tuple[str, int] | None:
+        """Find an open PR for *head_branch* and return ``(html_url, number)``, or ``None``."""
         owner = repository.split("/")[0] if "/" in repository else ""
         head_param = f"{owner}:{head_branch}" if owner else head_branch
         response = await self._client.get(
@@ -209,8 +216,22 @@ class GitHubGitService:
             return None
         pulls = response.json()
         if pulls:
-            return pulls[0].get("html_url")
+            return pulls[0].get("html_url"), pulls[0].get("number")
         return None
+
+    async def _update_pull_request(
+        self, repository: str, pr_number: int, *, title: str, body: str,
+    ) -> None:
+        """PATCH an existing pull request to update its title and body."""
+        response = await self._client.patch(
+            f"/repos/{repository}/pulls/{pr_number}",
+            json={"title": title, "body": body},
+        )
+        if response.status_code != 200:
+            logger.warning(
+                "Failed to update PR #%s title/body (status %s)",
+                pr_number, response.status_code,
+            )
 
     async def resolve_review_thread(self, pr_url: str, comment_node_id: str) -> None:
         """Resolve a PR review thread via the GitHub GraphQL API.
